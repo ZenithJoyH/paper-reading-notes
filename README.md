@@ -6,7 +6,7 @@
 
 | 论文 | 阅读笔记 | 原文 |
 | --- | --- | --- |
-| RadiK: Scalable and Optimized GPU-Parallel Radix Top-K Selection | [中文解读](RadiK_summary.md) | [arXiv 2501.14336](https://arxiv.org/abs/2501.14336) |
+| RadiK: Scalable and Optimized GPU-Parallel Radix Top-K Selection | [中文解读](RadiK_Scalable_and_Optimized_GPU-Parallel_Radix_Top-K_Selection_summary.md) | [arXiv 2501.14336](https://arxiv.org/abs/2501.14336) |
 
 ## RadiK 笔记内容
 
