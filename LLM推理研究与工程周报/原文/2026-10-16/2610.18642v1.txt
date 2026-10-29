@@ -1,0 +1,2737 @@
+MultiAlloc: Budget-Aware Precision Allocation for KV Cache Quantization
+Yangchengyu Zhou1*
+Zhiping Wu1,*
+Runchang Jiang2
+Dongdong Ren3
+Youfang Han4
+Wei Zhao4
+Dongqi Cai1
+Wenbin Li1†
+1Nanjing University
+2The Hong Kong University of Science and Technology
+3Geely
+4Goertek
+zhouyangchengyu@smail.nju.edu.cn
+zhipingwu@smail.nju.edu.cn
+rjiangaw@connect.ust.hk
+Dongdong.Ren2@geely.com
+fred.hanyf@goertek.com
+charles.zhaow@goertek.com
+cdq@nju.edu.cn
+liwenbin@nju.edu.cn
+Code: https://github.com/RL-MIND/MultiAlloc
+Abstract
+The Key-Value (KV) cache constitutes a dom-
+inant source of memory consumption during
+large language model (LLM) inference, par-
+ticularly in long-context and complex reason-
+ing scenarios. Existing KV cache quantization
+methods have explored different compression
+granularities, including layer-wise precision ad-
+justment and token-level information preser-
+vation. In practical deployment, however, the
+key challenge is not merely compression, but
+how to allocate limited quantization resources
+among heterogeneous precision preservation
+strategies under a fixed KV cache memory bud-
+get. We propose MultiAlloc, a profiling-guided
+precision allocation framework for KV cache
+quantization that adaptively distributes limited
+quantization resources between layer-wise pre-
+cision enhancement and token-wise preserva-
+tion. MultiAlloc employs lightweight offline
+profiling to characterize layer sensitivity and to-
+ken importance, enabling adaptive precision
+allocation under a fixed memory constraint.
+Guided by the profiled memory–accuracy trade-
+off, it automatically derives an effective pre-
+cision allocation strategy without online allo-
+cation search, and applies the resulting policy
+during inference. Extensive experiments on rea-
+soning and long-context benchmarks demon-
+strate that MultiAlloc consistently improves
+over layer-wise, token-wise, and recent multi-
+granularity KV cache quantization methods un-
+der matched memory budgets across diverse
+models, including Mistral, Llama, DeepSeek-
+Qwen, and QwQ.
+1
+Introduction
+As large language models (LLMs) become in-
+creasingly integral to long-context reasoning, com-
+*Equal contribution.
+†Corresponding author: liwenbin@nju.edu.cn.
+2-bit
+Only Layer-wise
+Broad layer protection, 
+but misses critical tokens
+...
+Acc. 
+(78.62%)
+...
+critical tokens
+sensitive layers
+4-bit
+FP 16
+𝑙1
+𝑙2
+𝑙n
+Selective token protection, 
+but misses sensitive layers
+Only Token-wise
+...
+Acc. 
+(78.09%)
+...
+𝑙1
+𝑙2
+𝑙n
+Coordinates broad layer protection 
+and selective token preservation
+MultiAlloc (Ours)
+...
+Acc. 
+(80.29%)
+...
+𝑙1
+𝑙2
+𝑙n
+Different layers favor different preservation strategies
+Figure 1: Motivation for budget-aware precision allo-
+cation under a fixed KV cache budget. Different layers
+exhibit heterogeneous demands for layer precision en-
+hancement and token preservation. Existing layer-wise
+and token-wise methods optimize individual preserva-
+tion strategies, while MultiAlloc profiles these demands
+and allocates the shared memory budget across preser-
+vation strategies.
+plex question answering, and multi-step planning,
+their growing inference-time memory footprint has
+emerged as a critical bottleneck to practical deploy-
+ment (Xiao et al., 2024; Kwon et al., 2023; Liu
+et al., 2026). In long-sequence generation, the Key–
+Value (KV) cache constitutes a dominant source of
+GPU memory consumption, making efficient KV
+cache compression a central challenge for scalable
+and cost-effective LLM inference (Zhang et al.,
+2026; Wang et al., 2026).
+Recent studies on KV cache quantization have
+developed increasingly targeted strategies to reduce
+memory overhead while preserving model accu-
+racy. KIVI (Liu et al., 2024) introduces asymmet-
+ric low-bit quantization by applying channel-level
+quantization to keys and token-level quantization
+to values, substantially reducing KV cache memory
+consumption. Subsequent token-oriented methods
+further improve this direction, with ZipCache (He
+1
+arXiv:2610.18642v1  [cs.LG]  13 Oct 2026
+
+et al., 2024) identifying salient tokens and OTT (Su
+et al., 2025) tracing and preserving outlier tokens
+at higher precision to reduce token quantization
+errors. However, these methods largely overlook
+the heterogeneous sensitivity of different layers.
+In contrast, KVTuner (Li et al., 2025) and PM-
+KVQ (Liu et al., 2026) allocate mixed precision
+according to layer or block sensitivity, thereby re-
+ducing quantization errors caused by layer hetero-
+geneity. Nevertheless, they generally apply uni-
+form token treatment within each layer and do not
+explicitly preserve token-level heterogeneity. Re-
+cent multi-granularity methods, such as KVmix (Li
+et al., 2026), further explore the joint adaptation
+of layer-wise precision and token-level preserva-
+tion by incorporating layer importance and pivotal
+context selection. However, their token-level adap-
+tation mainly focuses on context selection rather
+than precision allocation based on heterogeneous
+token importance.
+Motivated by these observations, we formulate
+KV cache quantization as a precision allocation
+problem under a fixed memory budget. We propose
+MultiAlloc, a profiling-guided precision allocation
+framework that characterizes heterogeneous pre-
+cision demands across layers and tokens. Specif-
+ically, MultiAlloc employs layer-wise sensitivity
+profiling to estimate the precision requirements
+of different layers, while token-wise importance
+profiling identifies tokens that benefit from high-
+precision preservation. Based on these comple-
+mentary profiling signals, MultiAlloc adaptively
+determines the allocation of limited quantization
+resources between layer-wise precision enhance-
+ment and token-wise high-precision preservation.
+All allocation decisions are derived offline and ap-
+plied as a static inference-time policy, eliminating
+online allocation search during inference.
+We conduct extensive experiments on reasoning
+and long-context benchmarks, including GSM8K,
+GPQA, and LongBench-v2, using models rang-
+ing from 7B to 32B parameters, including Llama-
+3-8B-Instruct (Grattafiori et al., 2024), Mistral-
+7B-Instruct-v0.3 (Jiang et al., 2023), DeepSeek-
+R1-Distill-Qwen-7B/14B (DeepSeek-AI, 2025),
+and QwQ-32B (Qwen Team, 2025). The results
+demonstrate that MultiAlloc consistently outper-
+forms representative layer-wise, token-wise, and
+importance-based KV cache quantization methods
+under matched KV cache memory budgets, with
+robust improvements across different model scales
+and both reasoning and long-context tasks.
+Our contributions are summarized as follows:
+• We reveal heterogeneous precision demands
+across layers and tokens in KV cache quanti-
+zation, motivating precision allocation under
+a fixed KV cache memory budget.
+• We propose MultiAlloc, a profiling-guided pre-
+cision allocation framework that models layer-
+wise sensitivity and token importance to adap-
+tively allocate limited quantization resources
+between layer precision enhancement and to-
+ken preservation.
+• Extensive experiments across diverse models
+and reasoning and long-context benchmarks
+demonstrate that MultiAlloc consistently out-
+performs representative layer-wise, token-
+wise, and importance-based KV cache quan-
+tization methods under matched KV cache
+memory budgets.
+2
+Related Work
+KV Cache Quantization and Precision Alloca-
+tion. Recent KV cache quantization methods ex-
+plore different strategies to reduce quantization er-
+rors while preserving inference quality. KIVI (Liu
+et al., 2024) introduces asymmetric low-bit quan-
+tization by applying channel-level quantization to
+keys and token-level quantization to values. Token-
+aware approaches, such as ZipCache (He et al.,
+2024) and OTT (Su et al., 2025), preserve salient
+tokens at higher precision to mitigate token quanti-
+zation errors. Layer-wise methods, including KV-
+Tuner (Li et al., 2025) and PM-KVQ (Liu et al.,
+2026), allocate mixed precision according to layer
+sensitivity. KVmix (Li et al., 2026) further ex-
+plores layer- and token-level adaptation, while KV-
+COBRA (Ha et al., 2026) studies budget-aware al-
+location of compression configurations under fixed
+memory constraints. MoE-nD (Sun et al., 2026)
+extends KV compression to multiple dimensions
+by jointly considering quantization and token re-
+duction. However, existing approaches mainly opti-
+mize individual compression strategies or configu-
+rations, without explicitly modeling heterogeneous
+precision demands across granularities or allocat-
+ing a shared budget between different precision
+preservation strategies.
+KV Cache Memory Management. Beyond
+quantization, another line of work focuses on man-
+aging KV cache memory usage during LLM infer-
+ence. PagedAttention (Kwon et al., 2023) improves
+2
+
+memory efficiency through virtual memory paging,
+while subsequent approaches such as H2O (Zhang
+et al., 2023), StreamingLLM (Xiao et al., 2024),
+SqueezeAttention (Wang et al., 2024), XKV (Li
+et al., 2024), and KVPR (Jiang et al., 2025) reduce
+memory pressure through token eviction, retention,
+or offloading strategies. These methods primarily
+optimize which KV entries to retain or where to
+store them, whereas MultiAlloc focuses on allocat-
+ing limited quantization resources among differ-
+ent precision preservation strategies within the KV
+cache representation.
+Differentiation of Our Work. Existing KV
+cache quantization methods have demonstrated the
+effectiveness of preserving important layers or to-
+kens at higher precision. However, they mainly fo-
+cus on identifying important components or adapt-
+ing individual precision strategies, without explic-
+itly modeling heterogeneous precision demands
+across different granularities. In contrast, MultiAl-
+loc introduces a profiling-guided precision alloca-
+tion framework that determines how limited quan-
+tization resources should be distributed between
+layer-wise precision enhancement and token-wise
+high-precision preservation under a fixed KV cache
+memory budget.
+3
+Preliminary
+3.1
+Generative Inference and KV Cache
+Transformer-based
+Large
+Language
+Models
+(LLMs) generate text autoregressively in two
+phases: prefilling and decoding. Given a prompt
+sequence of length Tin, prefilling processes all
+tokens in parallel to generate the initial Key-Value
+(KV) cache, while decoding generates new tokens
+token-by-token. To avoid recomputing historical
+representations, the Key and Value vectors of past
+tokens are cached in GPU memory. For an L-layer
+Transformer, let hl,t ∈Rd denote the hidden state
+of the t-th token at layer l. The query, key, and
+value vectors are computed via linear projections:
+ql,t = WQ
+l hl,t,
+kl,t = WK
+l hl,t,
+vl,t = WV
+l hl,t.
+(1)
+where WQ
+l , WK
+l , WV
+l
+∈Rd×d are learnable
+weight matrices. At decoding step t > Tin, the
+query ql,t attends to all cached keys and values.
+The KV cache is updated by concatenating the new
+vectors along the sequence dimension:
+Kl,≤t = Concat(Kl,<t, kl,t),
+Vl,≤t = Concat(Vl,<t, vl,t).
+(2)
+The attention output ol,t is:
+ol,t = softmax
+ 
+ql,tK⊤
+l,≤t
+√
+d
+!
+Vl,≤t.
+(3)
+As the sequence length T grows, the KV cache foot-
+print scales linearly as O(L·T ·d), often exceeding
+model-weight memory in long-context scenarios
+and becoming a primary inference bottleneck.
+3.2
+KV Cache Quantization
+To alleviate this bottleneck, Post-Training Quanti-
+zation (PTQ) compresses the KV cache into low-bit
+representations. For a tensor X (representing ei-
+ther K or V), uniform affine quantization maps
+floating-point values to b-bit integers:
+¯X = clamp
+X
+s + z
+
+, 0, 2b −1
+
+,
+(4)
+where s and z denote the scale factor and zero-
+point, respectively. The dequantized approxima-
+tion is reconstructed as ˆX = ( ¯X −z) · s. The
+quantization error E = ∥X −ˆX∥2
+F stems primarily
+from rounding and outlier clamping. Conventional
+quantization approaches often apply uniform bit-
+widths across layers and tokens, overlooking the
+heterogeneous precision requirements within KV
+cache representations.
+However, this overlooks the heterogeneous sen-
+sitivity of KV cache representations: (1) certain
+layers are more robust to quantization noise and
+can tolerate lower bit-widths, while (2) specific to-
+kens contribute disproportionately to quantization
+errors due to their distinct value distributions.
+4
+Method
+We propose MultiAlloc, a profiling-guided preci-
+sion allocation framework for KV cache quantiza-
+tion. As illustrated in Figure 2, MultiAlloc consists
+of three stages: decoupled precision demand profil-
+ing, budget-coupled precision allocation, and static
+policy execution.
+4.1
+Problem Formulation and Overview
+We formulate KV cache quantization as a preci-
+sion allocation problem under a fixed KV cache
+memory budget. Given a Transformer model with
+L layers, we aim to determine a static quantiza-
+tion policy that allocates limited quantization re-
+sources between layer-wise precision enhancement
+and token-wise high-precision preservation.
+3
+
+(c)  Static-policy execution
+Incoming KV Cache
+Transformer Layer 1
+Transformer Layer 2
+Transformer Layer L
+…
+2-bit
+4-bit
+Zoom-in: Multi-Granularity KV Cache View
+2-bit
+4-bit
+FP16
+Apply ( q* , k* )
+Layer
+Layer
+𝐿−1
+𝐿
+Online Inference
+Offline Profiling & Allocation
+(a)  Decoupled profiling
+(b)  Budget-coupled allocation
+Layer 1
+Pretrained LLM
+Layer 2
+…
+Layer L
+Calibration
+set
+Layer sensitivity 𝑺𝒍𝒃
+Token importance 𝒔𝒍,𝒕
+KV samples
+𝐾𝒍𝑉𝒍
+,
+Quantization error
+Qb
+ΔXl(b)
+KV gradients
+GlK, GlV
+l₁
+⋮
+l₂
+lL
+Low
+High
+2
+4
+8 (bits)
+Sensitivity profile
+Preserved tokens
+la
+0.3 0.4
+1.4
+0.5 0.6 0.5
+…
+0.3
+lb
+0.3
+1.3
+0.4
+1.5
+0.5 0.6
+…
+0.4
+k⁽¹⁾
+k⁽²⁾
+k⁽³⁾
+…
+Proxy loss
+t1
+t2
+t3
+t4
+t5
+t6
+tn
+t1
+t2
+t3
+t4
+t5
+t6
+tn
+Layer 1
+Layer 2
+Layer L
+Group-wise Top-k
+Token-loss profile
+∑
+t∈𝒰l(k)
+sl,t
+Token candidates
+Layer-bit allocation
+o1
+o2
+oi
+Joint policy selection
+Ji = ℒlayer(qi) + ℒtok(oi)
+o₁
+o₂
+oᵢ
+Layer loss
+Token loss
+Selected policy (q*, k*)
+Total KV budget B
+Btok
+Blayer
+Automatic budget allocation
+⋮
+⋮
+Btok
+Blayer
+Layer：
+…
+l₁
+l₂
+lL
+l3
+2-bit
+4-bit
+8-bit
+q1
+q2
+qi
+…
+…
+Blayer (oi)
+Total proxy loss
+★Selected
+⋯
+i* = arg mini Ji
+Layer bits
+Token capacities
+Layer 1
+k*1
+Layer 2
+q*2
+k*2
+Layer L
+k*L
+⋯
+⋯
+⋯
+Layer 3
+q*3
+k*3
+q*1
+q*L
+Top-k*L per group
+q*L-bit
+Figure 2: Overview of MultiAlloc. An offline profiling stage estimates layer-wise precision demands and token-wise
+preservation demands, followed by a budget-coupled precision allocation module that derives the static policy
+(q⋆, k⋆) under a fixed KV cache memory budget B. The policy is then directly applied during online inference.
+Specifically, let q = {ql}L
+l=1 denote the layer-
+wise bit-width configuration, where ql represents
+the quantization precision of the KV cache at layer
+l.
+Meanwhile, let k = {kl}L
+l=1 denote the to-
+ken preservation configuration, where kl represents
+the number of high-precision tokens preserved per
+group at layer l. The resulting policy is represented
+as π = (q, k).
+Given a fixed KV cache memory budget B, the
+objective is to minimize the quantization-induced
+degradation while satisfying the memory budget:
+min
+q,k L(q, k)
+s.t.
+M(q, k) ≤B.
+(5)
+where L(·) denotes the estimated degradation
+caused by KV cache compression and M(·) de-
+notes the corresponding memory consumption.
+Directly optimizing this objective requires
+searching over a large number of layer-wise pre-
+cision and token preservation configurations. To
+address this challenge, MultiAlloc adopts an of-
+fline profiling and allocation pipeline, as illustrated
+in Figure 2. First, the decoupled profiling stage
+estimates layer-wise precision demands and token-
+wise preservation demands from calibration data.
+Then, the budget-coupled precision allocation mod-
+ule evaluates candidate policies and determines the
+allocation of quantization resources between dif-
+ferent preservation strategies. Finally, the selected
+static policy is directly applied during online infer-
+ence without additional allocation search.
+4.2
+Layer-wise Precision Demand Estimation
+Different Transformer layers exhibit different sensi-
+tivity to KV cache quantization, resulting in hetero-
+geneous requirements for quantization precision.
+To estimate layer-wise precision demands, MultiAl-
+loc profiles the quantization-induced degradation
+of each layer under different bit-widths.
+Let Qb(·) denote the quantization operator with
+bit-width b. For the KV cache of layer l, the quan-
+tization errors of keys and values are defined as:
+∆K(b)
+l
+= Qb(Kl) −Kl,
+∆V(b)
+l
+= Qb(Vl) −Vl. (6)
+The impact of quantization errors on model out-
+put can be approximated by a first-order Taylor
+expansion:
+∆L(b)
+l
+≈
+ ∂L
+∂Kl , ∆K(b)
+l
+
++
+ ∂L
+∂Vl , ∆V(b)
+l
+
+.
+(7)
+In practice, we estimate the layer-wise degrada-
+tion using the magnitude of the first-order contribu-
+tion over calibration samples:
+Sl(b) = E
+h∆K(b)
+l
+⊙GK
+l
+
+1 +
+∆V(b)
+l
+⊙GV
+l
+
+1
+i
+, (8)
+where GK
+l =
+∂L
+∂Kl and GV
+l =
+∂L
+∂Vl .
+The resulting profile {Sl(b)}L
+l=1 captures the pre-
+cision requirements of different layers under can-
+didate bit-widths. These layer-wise precision de-
+mands are then provided to the budget-coupled
+allocation module to determine the layer precision
+configuration under the KV cache memory budget.
+4
+
+4.3
+Token-wise Preservation Demand
+Estimation
+Besides layer-wise precision differences, KV cache
+quantization also exhibits token-level heterogene-
+ity, where a small subset of tokens can contribute
+disproportionately to inference quality. MultiAl-
+loc therefore estimates token-wise preservation de-
+mands to determine how much high-precision stor-
+age should be allocated to different layers.
+For a token representation Kl,t at layer l, we
+measure its importance using the activation magni-
+tude:
+sl,t = ∥Kl,t∥1,
+(9)
+which provides a lightweight proxy for the contri-
+bution of token t to attention computation.
+During inference, tokens are organized into
+groups of size G. For each group, MultiAlloc pre-
+serves the top-kl tokens with higher precision ac-
+cording to their importance scores, while the re-
+maining tokens are quantized using the layer-wise
+assigned precision. To estimate the preservation
+demand, we measure the importance mass lost after
+preserving kl tokens in each group:
+Ltok(kl) =
+X
+t∈Gl
+sl,t −
+X
+t∈TopK(Gl,kl)
+sl,t,
+(10)
+where Gl denotes a token group at layer l.
+By evaluating different preservation capacities,
+we obtain a token-level preservation profile:
+{Ltok(kl)}L
+l=1,
+which characterizes the precision demand of pre-
+serving additional tokens. Together with the layer-
+wise precision profiles, these estimates provide
+complementary signals for the subsequent budget-
+coupled precision allocation.
+4.4
+Budget-Coupled Precision Allocation
+The layer-wise and token-wise profiling stages pro-
+vide complementary precision demand signals for
+allocation. However, both precision enhancement
+strategies compete for the same KV cache memory
+budget. Therefore, MultiAlloc performs budget-
+coupled precision allocation to determine how lim-
+ited quantization resources should be distributed
+between layer precision enhancement and token
+preservation.
+Given a KV cache memory budget B, we first
+construct a set of token preservation candidates:
+O = {oi}N
+i=1,
+(11)
+where each candidate oi specifies a layer-wise to-
+ken preservation capacity configuration:
+oi = {ki,l}L
+l=1.
+(12)
+For each candidate oi, its token preservation
+memory cost Mtok(oi) and degradation Ltok(oi)
+are estimated according to the token preservation
+profiles. The remaining memory budget is then
+assigned to layer-wise precision allocation:
+Blayer(oi) = B −Mtok(oi).
+(13)
+Under the remaining layer budget, the optimal
+layer-wise bit-width configuration is obtained by
+solving:
+q∗
+i = arg min
+q
+Llayer(q)
+s.t.
+Mlayer(q) ≤Blayer(oi),
+(14)
+where q = {ql}L
+l=1 denotes the layer-wise preci-
+sion configuration.
+Each candidate policy is then ranked using a
+surrogate degradation score:
+Ji = Llayer(q∗
+i ) + Ltok(oi).
+(15)
+The final precision allocation policy is selected
+as:
+i∗= arg min
+i
+Ji,
+(16)
+yielding the final policy
+π∗= (q∗, k∗).
+By coupling token preservation decisions with
+layer-wise precision allocation, MultiAlloc avoids
+manually specified budget splits and adaptively al-
+locates quantization resources according to hetero-
+geneous precision demands.
+4.5
+Static Policy Execution
+After the offline allocation stage, MultiAlloc ob-
+tains a static precision policy π∗, which specifies
+the layer-wise precision configuration and token
+preservation configuration. During inference, the
+policy is directly applied to incoming KV caches
+without additional allocation search.
+Specifically, for each layer l, newly generated
+KV states are quantized according to the assigned
+bit-width q∗
+l . Meanwhile, tokens are processed in
+groups according to the selected preservation con-
+figuration k∗. Within each group, the top-k∗
+l tokens
+with higher importance scores are stored in high
+5
+
+precision, while the remaining tokens are quantized
+using the corresponding layer-wise precision.
+The resulting KV cache combines quantized rep-
+resentations with preserved high-precision tokens,
+enabling efficient long-context inference under the
+fixed KV cache memory budget.
+5
+Experiments
+5.1
+Experimental Setup
+We evaluate reasoning and long-context perfor-
+mance on five instruction-tuned models span-
+ning architectures and scales:
+Llama-3-8B-
+Instruct (Grattafiori et al., 2024), Mistral-7B-
+Instruct-v0.3 (Jiang et al., 2023), DeepSeek-
+R1-Distill-Qwen-7B and DeepSeek-R1-Distill-
+Qwen-14B (DeepSeek-AI, 2025), and QwQ-
+32B (Qwen Team, 2025). We report accuracy on
+GSM8K (Cobbe et al., 2021) and GPQA (Rein
+et al., 2024), together with macro-averaged accu-
+racy across the six task categories of LongBench-
+v2 (Bai et al., 2025). The overall score averages
+the GPQA, GSM8K, and LongBench-v2 macro-
+average scores. Dataset statistics and evaluation
+details are provided in Appendix A. All methods
+use identical prompts, tokenization, stopping cri-
+teria, and greedy decoding. All experiments are
+conducted on NVIDIA A100 GPUs.
+For each model, we specify a model-dependent
+KV cache budget and evaluate all compressed meth-
+ods under the same KV cache memory budget,
+with budgets reported in Table 1. We compare
+OTT (Su et al., 2025), a representative token-wise
+preservation method, PM-KVQ (Liu et al., 2026), a
+representative layer-wise mixed-precision method,
+KVmix (Li et al., 2026), an importance-guided
+hybrid KV cache quantization method, and our
+profiling-guided precision allocation framework
+MultiAlloc. All methods are implemented within
+the same inference framework and follow a unified
+KV cache memory-accounting protocol.
+5.2
+Main Results under Fixed KV Budgets
+Table 1 reports the main results under fixed, model-
+specific KV cache budgets. For each model, OTT,
+PM-KVQ, KVmix, and MultiAlloc are evaluated
+under the same memory budget, while FP16 serves
+as an uncompressed reference. Across all five mod-
+els, MultiAlloc achieves the highest overall accu-
+racy among compressed methods, demonstrating
+the effectiveness of profiling-guided precision allo-
+cation under constrained KV cache budgets.
+This advantage remains evident as model scale
+increases. On DeepSeek-Qwen-14B, MultiAlloc
+matches the best compressed GPQA result and
+achieves the strongest performance on GSM8K
+and LongBench-v2. On QwQ-32B, it achieves the
+best GPQA and LongBench-v2 performance under
+the same budget. The smaller gains over exist-
+ing methods on larger models arise because their
+compressed performance already approaches FP16,
+leaving limited headroom for improvement. Never-
+theless, MultiAlloc closes 48.2% and 52.1% of the
+gaps on the 14B and 32B models, respectively.
+Although individual precision preservation
+strategies may perform well on specific bench-
+marks due to task-dependent sensitivity, MultiAlloc
+provides more balanced performance across reason-
+ing and long-context tasks by adaptively allocating
+quantization resources according to heterogeneous
+precision demands.
+5.3
+Ablation Studies
+We conduct ablation studies on Llama-3-8B-
+Instruct under a fixed 423 MB KV cache budget.
+All variants follow the same evaluation settings as
+the main experiments. We perform two analyses:
+precision dimension ablation for layer- wise preci-
+sion enhancement and token-wise preservation, and
+allocation ablation for profiling-guided precision
+allocation against manual budget splits.
+Table 2 reports the precision preservation abla-
+tion results. Layer-only removes token preserva-
+tion, while Token-only removes layer-wise preci-
+sion enhancement and preserves selected tokens
+under a uniform low-bit configuration. MultiAlloc
+allocates precision based on both layer-wise and
+token-wise precision demands. Removing either
+dimension degrades performance, confirming their
+complementary roles.
+Table 3 compares the profiling-guided allocation
+of MultiAlloc with manually specified allocation
+strategies between layer-wise precision enhance-
+ment and token preservation. The manual policies
+adopt 50/50, 65/35, and 35/65 budget splits, while
+MultiAlloc determines the allocation through of-
+fline profiling. The 65/35 split achieves compa-
+rable performance because it happens to closely
+match the allocation selected by MultiAlloc under
+this specific budget and model setting.
+5.4
+Different Memory Budgets Performance
+We evaluate MultiAlloc under multiple KV cache
+budgets to assess its robustness under varying
+6
+
+Model
+Method
+KV Budget
+GPQA
+GSM8K
+LongBench-v2
+Avg
+Llama-3-8B-Instruct
+FP16
+1024 MB
+32.83
+80.89
+24.79
+46.17
+OTT (ACL 2025)
+423 MB
+32.83
+76.95
+23.14
+44.31
+PM-KVQ (ICLR 2026)
+423 MB
+30.30
+79.98
+24.56
+44.95
+KVmix (AAAI 2026)
+423 MB
+32.83
+74.83
+26.94
+44.87
+MultiAlloc (Ours)
+423 MB
+32.83
+80.36
+25.85
+46.35
+Mistral-7B-Instruct
+FP16
+1024 MB
+27.27
+48.75
+24.78
+33.60
+OTT (ACL 2025)
+431 MB
+26.77
+44.96
+23.46
+31.73
+PM-KVQ (ICLR 2026)
+431 MB
+26.26
+47.76
+23.50
+32.51
+KVmix (AAAI 2026)
+431 MB
+26.26
+45.11
+25.55
+32.31
+MultiAlloc (Ours)
+431 MB
+27.27
+48.67
+23.94
+33.29
+DeepSeek-Qwen-7B
+FP16
+448 MB
+30.81
+90.37
+27.48
+49.55
+OTT (ACL 2025)
+180 MB
+28.28
+87.57
+17.82
+44.56
+PM-KVQ (ICLR 2026)
+180 MB
+29.80
+89.69
+25.68
+48.39
+KVmix (AAAI 2026)
+180 MB
+31.31
+82.11
+20.28
+44.57
+MultiAlloc (Ours)
+180 MB
+30.30
+90.14
+26.75
+49.06
+DeepSeek-Qwen-14B
+FP16
+1536 MB
+37.37
+89.39
+27.86
+51.54
+OTT (ACL 2025)
+620 MB
+35.35
+74.30
+24.28
+44.64
+PM-KVQ (ICLR 2026)
+620 MB
+37.37
+88.32
+25.63
+50.44
+KVmix (AAAI 2026)
+620 MB
+34.85
+88.32
+26.15
+49.77
+MultiAlloc (Ours)
+620 MB
+37.37
+89.01
+26.54
+50.97
+QwQ-32B
+FP16
+2048 MB
+39.39
+95.53
+28.03
+54.32
+OTT (ACL 2025)
+820 MB
+37.88
+95.22
+26.57
+53.22
+PM-KVQ (ICLR 2026)
+820 MB
+37.88
+95.07
+27.82
+53.59
+KVmix (AAAI 2026)
+820 MB
+38.38
+93.03
+27.73
+53.05
+MultiAlloc (Ours)
+820 MB
+38.38
+95.38
+28.15
+53.97
+Table 1: Main performance comparison of compressed methods under the same KV cache memory budgets.
+Variant
+Layer
+alloc.
+Token
+presv.
+LongBench-v2
+Layer-only
+✓
+×
+25.58
+Token-only
+×
+✓
+24.88
+MultiAlloc (Ours)
+✓
+✓
+25.85
+Table 2: Component ablation of layer-wise allocation
+and token-wise preservation.
+memory constraints. Experiments are conducted
+on Llama-3-8B-Instruct, Mistral-7B-Instruct, and
+DeepSeek-Qwen-14B using GSM8K. For each
+model, we select four model-specific budget points
+and compare OTT, PM-KVQ, KVmix, and Mul-
+tiAlloc under identical prompting, decoding, and
+evaluation settings.
+As shown in Table 4, MultiAlloc consistently
+achieves strong performance across different mod-
+els and KV cache budgets. Under tighter mem-
+ory constraints, it better preserves inference accu-
+racy than existing precision preservation strategies,
+while maintaining stable gains as the available bud-
+Allocation strategy
+GSM8K
+LongBench-v2
+Manual Split (65/35)
+80.29
+25.59
+Manual Split (50/50)
+77.79
+25.83
+Manual Split (35/65)
+77.41
+25.56
+MultiAlloc (Profiled)
+80.36
+25.85
+Table 3: Comparison between profiling-guided budget
+allocation and manual budget splits.
+get increases.
+These results demonstrate that MultiAlloc gen-
+eralizes across different memory regimes by adap-
+tively allocating limited quantization resources ac-
+cording to profiled precision demands, achieving
+a robust accuracy-memory trade-off under varying
+KV cache budgets.
+5.5
+Analysis of Allocation Behavior
+We further analyze the allocation policies pro-
+duced by MultiAlloc on Llama-3-8B-Instruct across
+GSM8K, GPQA, and LongBench-v2. As shown
+7
+
+Method / Budget
+B1
+B2
+B3
+B4
+Llama-3-8B-Instruct
+(FP16: 80.89)
+Budget (MB)
+283
+383
+423
+463
+OTT
+76.88
+77.56
+76.95
+78.09
+PM-KVQ
+58.83
+79.00
+79.98
+78.62
+KVmix
+75.13
+74.07
+74.83
+75.21
+MultiAlloc (Ours)
+77.33
+79.15
+80.36
+80.29
+Mistral-7B-Instruct
+(FP16: 48.75)
+Budget (MB)
+311
+351
+391
+431
+OTT
+43.52
+44.88
+45.64
+44.96
+PM-KVQ
+47.69
+49.20
+47.31
+47.76
+KVmix
+41.62
+43.52
+44.12
+45.11
+MultiAlloc (Ours)
+48.22
+49.36
+47.01
+48.67
+DeepSeek-Qwen-14B
+(FP16: 89.39)
+Budget (MB)
+500
+540
+580
+620
+OTT
+72.86
+72.48
+73.92
+74.30
+PM-KVQ
+87.49
+87.95
+88.10
+88.32
+KVmix
+85.97
+86.13
+87.57
+88.32
+MultiAlloc (Ours)
+89.23
+88.25
+88.70
+89.01
+Table 4: Comparison of GSM8K accuracy (%) across
+multiple models under different KV cache budgets.
+in Figure 3, MultiAlloc generates non-uniform al-
+location policies with both shared structures and
+task-dependent variations, reflecting heterogeneous
+precision demands across workloads.
+Figure 3(a) presents the layer-wise KV cache
+bit-width allocation produced by MultiAlloc. The
+allocation exhibits clear layer-wise variation, where
+sensitive layers receive higher precision while most
+layers are assigned lower bit-widths under the fixed
+KV cache budget. Task-dependent differences fur-
+ther show that offline profiling adapts bit-width
+allocation according to workload characteristics.
+Figure 3(b) presents the token preservation ca-
+pacity allocation produced by MultiAlloc. Com-
+pared with layer-wise bit-width allocation, token
+preservation exhibits stronger task-dependent varia-
+tion. GSM8K preserves more tokens across a wider
+range of layers, while GPQA and LongBench-v2
+concentrate preservation on specific layers. This
+sparse allocation shows that MultiAlloc selectively
+assigns precision resources to important tokens.
+5.6
+Runtime Efficiency
+We evaluate the runtime efficiency of FP16, OTT,
+PM-KVQ, KVmix, and MultiAlloc on Llama-3-
+8B-Instruct using NVIDIA A100 GPUs under the
+same 423 MB KV cache budget. We measure de-
+coding throughput under varying input and gener-
+ation lengths with batch size one, and average the
+0
+4
+8
+12
+16
+20
+24
+28
+31
+Layer index
+GSM8K
+GPQA
+LB-v2
+2
+4
+8
+KV precision (bits)
+(a) Layer-wise KV cache bit-width allocation.
+0
+4
+8
+12
+16
+20
+24
+28
+31
+Layer index
+GSM8K
+GPQA
+LB-v2
+3 2 2 3 1
+2 3 11 1 1 5 2 4 7 1 1
+2 4 2 1
+2
+7 2
+1
+1 1 2
+3 2 2 4
+1
+2
+4 3 1
+1 2 2
+3 1 2 6
+3
+0
+2
+4
+6
+8
+10
+Outliers per group
+(b) Token preservation capacity allocation.
+Figure 3: Allocation behavior of MultiAlloc across dif-
+ferent tasks under heterogeneous precision demands.
+2K
+8K
+Input length (tokens)
+0
+10
+20
+30
+40
+50
+Decoding throughput (tokens/s)
+(a)
+1.26×
+2.55×
+1.26×
+3.37×
+64
+128
+Generation length (tokens)
+0
+10
+20
+30
+40
+50
+Decoding throughput (tokens/s)
+(b)
+1.37×
+2.75×
+1.14×
+2.28×
+FP16
+OTT
+PM-KVQ
+KVmix
+MultiAlloc (ours)
+Figure 4: Runtime efficiency comparison on Llama-
+3-8B-Instruct under the same KV cache budget with
+varying input and generation lengths.
+results over five runs after warm-up. The one-time
+offline profiling cost of MultiAlloc is excluded. As
+shown in Figure 4, MultiAlloc consistently achieves
+higher decoding throughput than quantized base-
+lines across different input and generation lengths.
+It delivers 1.25–1.26× speedup over the fastest
+quantized baseline (KVmix) under varying input
+lengths and 1.13–1.41× speedup under different
+generation lengths, demonstrating efficient static
+policy execution during inference.
+6
+Conclusion
+In this work, we formulate KV cache quantization
+under a fixed KV cache memory budget as a preci-
+sion allocation problem, where limited quantization
+resources are adaptively distributed between layer-
+wise precision enhancement and token-wise preser-
+vation. We propose MultiAlloc, a profiling-guided
+framework that characterizes heterogeneous preci-
+sion demands across layers and tokens, and derives
+a static precision policy through budget-coupled al-
+location. Extensive experiments on reasoning and
+long-context benchmarks demonstrate that Multi-
+Alloc consistently outperforms representative layer-
+wise, token-wise, and importance-based KV cache
+quantization methods under matched KV cache
+8
+
+memory budgets.
+7
+Limitations
+This work focuses on profiling-guided precision
+allocation for KV cache quantization under fixed
+memory budgets. While MultiAlloc eliminates on-
+line allocation search through offline policy deriva-
+tion, the profiling stage introduces preprocessing
+overhead and requires representative calibration
+data. Future work will explore lightweight profil-
+ing and improved policy generalization.
+References
+Yushi Bai, Shangqing Tu, Jiajie Zhang, Hao Peng, Xi-
+aozhi Wang, Xin Lv, Shulin Cao, Jiazheng Xu, Lei
+Hou, Yuxiao Dong, et al. 2025. LongBench v2: To-
+wards deeper understanding and reasoning on real-
+istic long-context multitasks. In Proceedings of the
+63rd Annual Meeting of the Association for Compu-
+tational Linguistics (Volume 1: Long Papers), pages
+3639–3664.
+Karl Cobbe, Vineet Kosaraju, Mohammad Bavarian,
+Mark Chen, Heewoo Jun, Lukasz Kaiser, Matthias
+Plappert, Jerry Tworek, Jacob Hilton, Reiichiro
+Nakano, et al. 2021. Training verifiers to solve math
+word problems. arXiv preprint arXiv:2110.14168.
+DeepSeek-AI. 2025. DeepSeek-R1: Incentivizing rea-
+soning capability in LLMs via reinforcement learning.
+Preprint, arXiv:2501.12948.
+Aaron Grattafiori, Abhimanyu Dubey, Abhinav Jauhri,
+Abhinav Pandey, Abhishek Kadian, Ahmad Al-
+Dahle, Aiesha Letman, Akhil Mathur, Alan Schelten,
+Alex Vaughan, et al. 2024. The llama 3 herd of mod-
+els. arXiv preprint arXiv:2407.21783.
+Sihyeon Ha, Jaeho Lee, and Yo-Seb Jeon. 2026.
+KV-COBRA: KV cache compression via co-
+optimized bit-rank allocation.
+arXiv preprint
+arXiv:2609.24298.
+Yefei He, Luoming Zhang, Weijia Wu, Jing Liu, Hong
+Zhou, and Bohan Zhuang. 2024. ZipCache: Accurate
+and efficient kv cache quantization with salient token
+identification. In Advances in Neural Information
+Processing Systems.
+Albert Q. Jiang, Alexandre Sablayrolles, Arthur Men-
+sch, Chris Bamford, Devendra Singh Chaplot, Diego
+de las Casas, Florian Bressand, Gianna Lengyel, Guil-
+laume Lample, Lucile Saulnier, Lélio Renard Lavaud,
+Marie-Anne Lachaux, Pierre Stock, Teven Le Scao,
+Thibaut Lavril, Thomas Wang, Timothée Lacroix,
+and William El Sayed. 2023.
+Mistral 7b.
+arXiv
+preprint arXiv:2310.06825.
+Chaoyi Jiang, Lei Gao, Hossein Entezari Zarch, and
+Murali Annavaram. 2025. KVPR: Efficient llm infer-
+ence with i/o-aware kv cache partial recomputation.
+In Findings of the Association for Computational
+Linguistics: ACL 2025.
+Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying
+Sheng, Lianmin Zheng, Cody Hao Yu, Joseph Gon-
+zalez, Hao Zhang, and Ion Stoica. 2023. Efficient
+memory management for large language model serv-
+ing with PagedAttention. In Proceedings of the 29th
+Symposium on Operating Systems Principles. Asso-
+ciation for Computing Machinery.
+Fei Li, Song Liu, Weiguo Wu, Shiqiang Nie, and
+Jinyu Wang. 2026. KVmix: Gradient-based layer
+importance-aware mixed-precision quantization for
+KV cache. In Proceedings of the AAAI Conference
+on Artificial Intelligence, volume 40, pages 31563–
+31572.
+Weizhuo Li, Zhigang Wang, Yu Gu, and Ge Yu.
+2024. XKV: Personalized kv cache memory reduc-
+tion for long-context llm inference. arXiv preprint
+arXiv:2412.05896.
+Xing Li, Zeyu XING, Yiming Li, Linping Qu, Hui-Ling
+Zhen, Yiwu Yao, Wulong Liu, Sinno Jialin Pan, and
+Mingxuan Yuan. 2025. KVTuner: Sensitivity-aware
+layer-wise mixed-precision kv cache quantization
+for efficient and nearly lossless llm inference. In
+Forty-second International Conference on Machine
+Learning.
+Tengxuan Liu, Shiyao Li, Jiayi Yang, Tianchen Zhao,
+Feng Zhou, Xiaohui Song, Guohao Dai, Shengen
+Yan, Huazhong Yang, and Yu Wang. 2026. PM-KVQ:
+Progressive mixed-precision KV cache quantization
+for long-CoT LLMs. In The Fourteenth International
+Conference on Learning Representations.
+Zirui Liu, Jiayi Yuan, Hongye Jin, Shaochen Zhong,
+Zhaozhuo Xu, Vladimir Braverman, Beidi Chen, and
+Xia Hu. 2024. KIVI: A tuning-free asymmetric 2bit
+quantization for kv cache. In Forty-first International
+Conference on Machine Learning.
+Qwen Team. 2025. Qwq-32b: Embracing the power of
+reinforcement learning.
+David Rein, Betty Li Hou, Asa Cooper Stickland, Jack-
+son Petty, Richard Yuanzhe Pang, Julien Dirani, Ju-
+lian Michael, and Samuel R Bowman. 2024. GPQA:
+A graduate-level google-proof q&a benchmark. In
+First Conference on Language Modeling.
+Yi Su, Yuechi Zhou, Quantong Qiu, Juntao Li, Qingrong
+Xia, Ping Li, Xinyu Duan, Zhefeng Wang, and Min
+Zhang. 2025. Accurate kv cache quantization with
+outlier tokens tracing. In Proceedings of the 63rd
+Annual Meeting of the Association for Computational
+Linguistics.
+Libo Sun, Peixiong He, Po-Wei Harn, and Xiao Qin.
+2026. MoE-nD: Per-layer mixture-of-experts routing
+for multi-axis KV cache compression. arXiv preprint
+arXiv:2604.17695.
+9
+
+He Wang, Yu Gu, Fangfang Li, Zhigang Wang, Zheng-
+hao Liu, Ning Wang, Xiaohua Li, and Ge Yu. 2026.
+HqeKV: Towards hybrid quantization and eviction
+for KV cache in long-context LLM inference. In
+Findings of the Association for Computational Lin-
+guistics: ACL 2026, pages 4138–4153.
+Zihao Wang, Bin Cui, and Shaoduo Gan. 2024.
+Squeezeattention: 2D management of KV-cache in
+LLM inference via layer-wise optimal budget. arXiv
+preprint arXiv:2404.04793.
+Guangxuan Xiao, Yuandong Tian, Beidi Chen, Song
+Han, and Mike Lewis. 2024. Efficient streaming lan-
+guage models with attention sinks. In The Twelfth
+International Conference on Learning Representa-
+tions.
+Tao Zhang, Ziqian Zeng, Hao Peng, Huiping Zhuang,
+and Cen Chen. 2026. MixKVQ: Query-aware mixed-
+precision KV cache quantization for long-context
+reasoning. In Proceedings of the 64th Annual Meet-
+ing of the Association for Computational Linguistics
+(Volume 1: Long Papers), pages 7189–7204.
+Zhenyu Zhang, Ying Sheng, Tianyi Zhou, Tianlong
+Chen, Lianmin Zheng, Ruisi Cai, Zhao Song,
+Yuandong Tian, Christopher Ré, Clark Barrett,
+Zhangyang “Atlas” Wang, and Beidi Chen. 2023.
+H2O: Heavy-hitter oracle for efficient generative in-
+ference of large language models. In Advances in
+Neural Information Processing Systems.
+10
+
+A
+Experimental Setup and Calibration
+Details
+This appendix provides additional details on the
+evaluated models and benchmarks, the evaluation
+protocol, and the task-specific calibration proce-
+dure used by MultiAlloc. Unless otherwise speci-
+fied, all compressed methods follow the same eval-
+uation settings as the FP16 baseline.
+A.1
+Models and Benchmarks
+Models.
+We
+evaluate
+MultiAlloc
+on
+five
+instruction-tuned
+language
+models
+covering
+different model families and parameter scales:
+Llama-3-8B-Instruct,
+Mistral-7B-Instruct-v0.3,
+DeepSeek-R1-Distill-Qwen-7B,
+DeepSeek-R1-
+Distill-Qwen-14B, and QwQ-32B. These models
+range from 7B to 32B parameters and include
+both general-purpose instruction-tuned models and
+reasoning-oriented models.
+GPQA.
+GPQA is a multiple-choice benchmark
+designed to evaluate expert-level scientific reason-
+ing. We use the GPQA-Diamond subset, which
+contains 198 four-option questions. Accuracy is
+reported over the evaluated questions.
+GSM8K.
+GSM8K evaluates multi-step mathe-
+matical reasoning using grade-school word prob-
+lems. The dataset contains 7,473 training examples
+and 1,319 test examples. We report accuracy on
+the test set based on the extracted final numerical
+answer.
+LongBench-v2.
+LongBench-v2 evaluates long-
+context understanding and reasoning in realistic
+scenarios. It contains 503 multiple-choice ques-
+tions spanning six task categories: single-document
+question answering, multi-document question an-
+swering, long in-context learning, code repository
+understanding, long dialogue history understand-
+ing, and long structured-data understanding. Fol-
+lowing the main paper, we report the unweighted
+macro-averaged accuracy across the six task cate-
+gories.
+A.2
+Evaluation Protocol
+For each model, the FP16 baseline and all com-
+pressed methods use identical evaluation examples,
+prompt templates, tokenization, stopping criteria,
+answer-scoring procedures, and greedy decoding.
+Therefore, the compared methods differ only in
+their KV-cache compression strategies while fol-
+lowing the same benchmark-specific evaluation
+protocol.
+GPQA.
+We evaluate GPQA-Diamond on all
+198 questions using the zero-shot direct-choice
+protocol with option permutation,
+following
+lm-evaluation-harness. We use a fixed random
+seed of 0 and greedy decoding, with a maximum
+generation length of 1,024 tokens. The generated
+response is mapped to the corresponding multiple-
+choice option for accuracy evaluation.
+GSM8K.
+We evaluate all 1,319 examples from
+the GSM8K test set. The final numerical answer is
+extracted from the generated response and evalu-
+ated using exact match. Generation is performed
+with greedy decoding and is capped at 1,024 to-
+kens. FP16 and all compressed methods use the
+same generation and answer-extraction procedure.
+LongBench-v2.
+We evaluate all 503 examples
+in LongBench-v2 and report the unweighted
+macro-average accuracy over its six task cate-
+gories. All methods use greedy decoding. For
+Llama-3-8B-Instruct and Mistral-7B-Instruct-v0.3,
+the maximum generation length is 128 tokens.
+For DeepSeek-R1-Distill-Qwen-7B, DeepSeek-
+R1-Distill-Qwen-14B, and QwQ-32B, the maxi-
+mum generation length is 64 tokens, with explicit
+thinking disabled.
+QwQ-32B additionally uses
+constrained-choice decoding. Invalid, truncated,
+or failed generations are counted as incorrect.
+A.3
+Task-Specific Calibration Protocol
+MultiAlloc uses a task-specific calibration set for
+each evaluated benchmark. In other words, the
+profiling statistics used for GSM8K, GPQA, and
+LongBench-v2 are collected from separate calibra-
+tion sets corresponding to the target workload. For
+a given model and task, the calibration data are
+used to estimate the layer-wise precision demand
+and token-wise preservation demand required by
+the offline allocator. The resulting allocation policy
+is then fixed and applied throughout inference for
+that workload.
+Why
+task-specific
+calibration?
+MultiAlloc
+adopts workload-aware offline profiling because
+the precision demand of KV cache quantization is
+inherently dependent on the workload characteris-
+tics. Rather than deriving a single universal allo-
+cation policy, MultiAlloc estimates the precision
+requirements under the target inference workload,
+where different tasks may induce distinct activation
+11
+
+distributions and token importance patterns. These
+variations affect both the relative quantization sen-
+sitivity of Transformer layers and the benefit of
+preserving selected tokens in higher precision.
+This design is analogous to the calibration pro-
+cess commonly used in post-training quantization,
+where representative samples are used to character-
+ize model behavior before deployment. The calibra-
+tion data are only used to collect offline profiling
+statistics, including layer-wise quantization sensi-
+tivity and token-level preservation demand, rather
+than to optimize task-specific model parameters or
+access inference labels. As shown in the allocation
+analysis in the main paper, different workloads pro-
+duce a stable layer-precision backbone with task-
+dependent variations in both layer-wise precision
+assignment and token-wise high-precision preser-
+vation.
+Therefore, workload-specific calibration enables
+MultiAlloc to allocate the limited KV cache budget
+according to the precision demands of the target
+deployment scenario instead of relying on a manu-
+ally designed fixed allocation strategy. Importantly,
+all profiling and allocation decisions are completed
+offline. Once the precision policy is generated, in-
+ference directly applies the static policy without
+online profiling, search, or dynamic reallocation.
+A.4
+Implementation Details
+All experiments are conducted on NVIDIA A100
+GPUs with 80 GB of memory. Our implementa-
+tion uses Python 3.10, PyTorch 2.5.1, Transform-
+ers 4.49.0, and Datasets 3.3.2. All methods use the
+same model checkpoints and software environment,
+with a batch size of one.
+For each benchmark, FP16 and all compressed
+methods share identical preprocessing, prompting,
+tokenization, decoding, and stopping criteria. The
+KV-cache budgets used for the main comparison
+are reported in Table 1 of the main paper.
+For MultiAlloc, profiling and budget-aware allo-
+cation are performed offline. Each model–dataset
+pair is profiled for the corresponding target KV-
+cache budget, and the resulting allocation policy is
+saved and directly loaded during inference. Con-
+sequently, online inference involves no profiling,
+candidate-policy enumeration, dynamic program-
+ming, budget search, or adaptive reallocation.
+Runtime measurements exclude the one-time
+offline profiling cost and are averaged over five
+runs after warm-up.
+For reproducibility, each
+run records the complete experimental configura-
+tion, software environment, GPU information, and
+source-code fingerprint. Model and dataset ver-
+sions, memory budgets, decoding settings, and eval-
+uation protocols are specified in the corresponding
+experiment configuration files.
+B
+Profiling-based Precision Demand
+Estimation
+Directly evaluating the downstream performance
+of every candidate precision configuration would
+require repeated end-to-end inference and is pro-
+hibitively expensive.
+Instead, MultiAlloc con-
+structs lightweight profiling surrogates to charac-
+terize the relative precision demand at different
+granularities. These surrogates are not intended
+to predict the absolute downstream accuracy of
+a compressed model. Rather, they provide rela-
+tive preference signals among candidate precision-
+preservation choices during offline allocation.
+Specifically, we separately estimate (i) the sensi-
+tivity of different Transformer layers to KV cache
+quantization under different bit-widths and (ii) the
+benefit of selectively preserving important tokens
+in higher precision.
+B.1
+Layer-wise Precision Demand Estimation
+The layer-wise precision demand is estimated by
+quantifying the impact of KV cache quantization
+under different candidate bit-widths. The estima-
+tion is based on first-order perturbation analysis,
+where the quantization-induced changes of KV rep-
+resentations are used to approximate their influence
+on the profiling objective.
+Let L denote the profiling loss, instantiated as
+the next-token negative log-likelihood on the cali-
+bration set Dcal. For a Transformer layer l, quan-
+tizing its KV cache to b bits produces:
+¯K(b)
+l
+= Qb(Kl),
+¯V (b)
+l
+= Qb(Vl),
+(17)
+where Qb(·) denotes the quantization operator
+with bit-width b. The corresponding quantization
+perturbations are defined as:
+∆K(b)
+l
+= ¯K(b)
+l
+−Kl,
+∆V (b)
+l
+= ¯V (b)
+l
+−Vl. (18)
+Treating the KV representations as intermediate
+variables in the computation graph, the loss varia-
+tion caused by quantization can be approximated
+using a first-order Taylor expansion:
+12
+
+∆L(b)
+l
+≈
+ ∂L
+∂Kl , ∆K(b)
+l
+
++
+ ∂L
+∂Vl , ∆V (b)
+l
+
+.
+(19)
+Directly using the signed perturbation may un-
+derestimate the quantization impact, since positive
+and negative contributions across different tensor
+elements can cancel each other. Therefore, we mea-
+sure the magnitude of first-order perturbations with
+the following non-negative surrogate:
+Φ(b)
+l
+=
+∆K(b)
+l
+⊙GK
+l
+
+1 +
+∆V (b)
+l
+⊙GV
+l
+
+1 ,
+(20)
+where
+GK
+l
+= ∂L
+∂Kl ,
+GV
+l = ∂L
+∂Vl ,
+(21)
+and ⊙denotes element-wise multiplication. The
+surrogate preserves the magnitude of quantization-
+induced perturbations while avoiding cancellation
+among individual KV elements.
+The layer-wise precision demand under candi-
+date bit-width b is estimated as:
+Sl(b) = E(x,y)∼Dcal
+h
+Φ(b)
+l
+i
+.
+(22)
+Given Ncal calibration samples, the expectation
+is approximated by:
+ˆSl(b) =
+1
+Ncal
+Ncal
+X
+i=1
+∆K(b)
+i,l ⊙GK
+i,l
+
+1
++
+∆V (b)
+i,l ⊙GV
+i,l
+
+1
+
+.
+(23)
+For each calibration sample, one forward-
+backward pass is sufficient to obtain the full-
+precision KV representations and their gradients.
+The collected KV states are then reused to evaluate
+different candidate bit-widths through lightweight
+quantization and surrogate computation, without
+additional gradient computation.
+The obtained profile {Sl(b)}L
+l=1 characterizes
+the relative precision demand of different layers
+under different quantization levels. These layer-
+wise demand estimates are provided to the budget-
+coupled allocation stage, where precision candi-
+dates are selected according to the quantified quan-
+tization sensitivity under the target KV cache bud-
+get.
+B.2
+Token-wise Preservation Demand
+Estimation
+Besides layer-wise precision variation, KV cache
+quantization also exhibits heterogeneous token-
+level precision requirements. Although most to-
+kens can be stored using the layer-wise base pre-
+cision, a small subset of tokens may introduce
+larger quantization errors and benefit from addi-
+tional high-precision preservation. Therefore, we
+estimate the token-wise preservation demand to
+characterize the benefit of allocating additional
+memory to preserved tokens.
+For calibration sample i, layer l, and cached
+token position t, let Ki,l,t denote the corresponding
+key representation. We define the token importance
+score as:
+si,l,t = ∥Ki,l,t∥1.
+(24)
+This metric is motivated by the scaled dot-
+product attention mechanism. For a query vector
+qi,l and a cached key representation Ki,l,t, the at-
+tention logit satisfies:
+|⟨qi,l, Ki,l,t⟩| ≤∥qi,l∥∞∥Ki,l,t∥1.
+(25)
+Therefore, the magnitude of the key represen-
+tation provides a lightweight query-independent
+proxy for the potential contribution of a token to at-
+tention computation. Unlike exact attention scores,
+which depend on individual queries during infer-
+ence, this proxy can be collected offline and reused
+for static policy construction.
+For each calibration sample i and layer l, the eli-
+gible cached tokens are partitioned into contiguous
+groups
+Gi,l = {Gi,l,1, . . . , Gi,l,ni,l},
+(26)
+where each group contains at most G tokens, and
+the final group may contain fewer than G tokens if
+the eligible sequence length is not divisible by the
+group size.
+For a preservation capacity kl, the high-precision
+token set within group Gi,l,g is selected as
+Pi,l,g(kl) = TopK ({si,l,t : t ∈Gi,l,g}, kl) . (27)
+The selected tokens are preserved in higher pre-
+cision, while the remaining tokens are stored using
+the layer-wise base precision determined by the
+allocation stage.
+13
+
+To quantify the information not covered by high-
+precision preservation, we define the discarded im-
+portance mass of each group as
+ℓtok
+i,l,g(kl) =
+X
+t∈Gi,l,g
+si,l,t −
+X
+t∈Pi,l,g(kl)
+si,l,t
+=
+X
+t∈Gi,l,g\Pi,l,g(kl)
+si,l,t.
+(28)
+This quantity measures the accumulated impor-
+tance of tokens that are not preserved in high pre-
+cision. A smaller value indicates that the selected
+preservation capacity covers more influential to-
+kens and therefore provides stronger protection for
+important KV representations.
+For a complete token-preservation configuration
+k = {kl}L
+l=1, the token-wise preservation demand
+is estimated by aggregating the group-level dis-
+carded importance over the calibration traces:
+Ltok(k) =
+1
+Ncal
+Ncal
+X
+i=1
+1
+L
+L
+X
+l=1
+1
+ni,l
+ni,l
+X
+g=1
+ℓtok
+i,l,g(kl).
+(29)
+The obtained token preservation profile charac-
+terizes the benefit of allocating additional high-
+precision storage across layers.
+Together with
+the layer-wise precision demand profile {Sl(b)},
+it provides a complementary signal for the budget-
+coupled allocation stage, where the limited KV
+cache budget is distributed between layer-wise pre-
+cision enhancement and token-wise preservation.
+B.3
+Complementary Precision Demands
+The layer-wise and token-wise profiling stages char-
+acterize different dimensions of precision hetero-
+geneity in KV cache quantization. Although both
+signals reflect the impact of quantization, they cap-
+ture complementary precision demands at different
+granularities.
+The layer-wise precision demand describes the
+quantization sensitivity of each Transformer layer
+under different bit-width configurations. It deter-
+mines where increasing the base precision of the
+KV cache can provide larger benefits. In contrast,
+the token-wise preservation demand focuses on the
+additional benefit of retaining selected tokens in
+higher precision within each layer. It identifies
+where extra memory allocation can better preserve
+important token representations.
+These two precision demands correspond to dif-
+ferent allocation choices. Layer-wise precision en-
+hancement provides broad protection by improving
+the base representation quality of sensitive layers,
+while token-wise preservation provides selective
+protection for a sparse subset of tokens that remain
+vulnerable under the assigned layer precision.
+Under a fixed KV cache memory budget, these
+two strategies compete for the same limited quan-
+tization resources. Allocating more memory to
+increase layer precision reduces the available bud-
+get for token preservation, while preserving more
+high-precision tokens limits the memory available
+for layer-wise enhancement. Therefore, optimiz-
+ing either precision dimension independently can-
+not achieve the best allocation under a constrained
+memory budget.
+The two profiling signals are consequently com-
+bined in the subsequent budget-coupled allocation
+stage, where MultiAlloc determines how the avail-
+able KV cache budget should be distributed be-
+tween layer-wise precision enhancement and token-
+wise preservation.
+C
+Budget-Coupled Allocation
+Optimization
+C.1
+Memory Accounting under Fixed KV
+Cache Budget
+MultiAlloc formulates KV cache quantization as a
+precision allocation problem under a fixed memory
+constraint. Unlike approaches that optimize layer-
+wise precision assignment or token preservation
+separately, the two precision preservation strate-
+gies share the same KV cache budget and must be
+considered within a unified allocation framework.
+Given a total KV cache budget B, a precision al-
+location policy is defined by a layer-wise bit-width
+configuration
+q = {ql}L
+l=1,
+(30)
+and a token preservation configuration
+k = {kl}L
+l=1,
+(31)
+where ql denotes the base KV precision assigned
+to layer l, and kl represents the number of high-
+precision tokens preserved within each token group
+of layer l.
+The allocation objective is formulated as min-
+imizing the quantization degradation under the
+memory constraint:
+14
+
+min
+q,k L(q, k)
+s.t.
+M(q, k) ≤B.
+(32)
+The memory consumption of a policy is decom-
+posed into two components:
+M(q, k) = Mlayer(q) + Mtoken(k),
+(33)
+where Mlayer(q) denotes the memory consump-
+tion of the layer-wise quantized KV cache, and
+Mtoken(k) represents the additional memory re-
+quired for preserving selected tokens in higher pre-
+cision.
+For a given token preservation configuration k,
+the remaining budget available for layer-wise pre-
+cision allocation is:
+Blayer = B −Mtoken(k).
+(34)
+Therefore, increasing token preservation capac-
+ity inevitably reduces the memory available for
+layer-wise precision enhancement, while allocating
+higher layer precision limits the budget for addi-
+tional token preservation. This budget coupling mo-
+tivates the subsequent allocation procedure, which
+determines how the limited KV cache memory
+should be distributed between the two precision
+dimensions.
+C.2
+Layer-wise Allocation Solver
+Given a remaining layer-wise budget Blayer, the
+layer-wise allocation stage selects the precision
+configuration according to the profiled layer-wise
+precision demands.
+Specifically, the layer-wise allocation problem
+is formulated as:
+q∗= arg min
+q
+L
+X
+l=1
+Sl(ql)
+(35)
+subject to:
+L
+X
+l=1
+Ml(ql) ≤Blayer,
+(36)
+where Sl(ql) denotes the estimated precision de-
+mand of layer l under the assigned bit-width ql.
+The objective selects one precision candidate
+for each layer while satisfying the given memory
+constraint. Since the candidate bit-width set is
+small, the problem can be efficiently solved using
+dynamic programming over a discretized memory
+grid.
+Let ˆB denote the discretized budget capacity.
+The dynamic programming state represents the min-
+imum accumulated precision demand after assign-
+ing bit-width candidates to the first l layers:
+DP[l, c] = min
+b {DP[l −1, c −Cl(b)] + Sl(b)}.
+(37)
+After processing all layers, backtracking recov-
+ers the selected layer-wise precision configuration:
+q∗= {q∗
+l }L
+l=1.
+(38)
+The recovered configuration satisfies the original
+byte-level memory constraint because candidate
+memory costs are conservatively discretized during
+optimization.
+C.3
+Collective Budget Allocation
+The final allocation stage determines how the fixed
+KV cache budget should be distributed between to-
+ken preservation and layer-wise precision enhance-
+ment. Instead of manually specifying the budget
+ratio between the two strategies, MultiAlloc eval-
+uates different cross-granularity allocation candi-
+dates under the same memory constraint.
+Specifically, MultiAlloc constructs a finite set of
+token preservation configurations:
+K = {ki}N
+i=1,
+(39)
+where each candidate ki specifies the layer-wise
+token preservation capacities.
+For each candidate token configuration ki, its
+memory consumption is first calculated as:
+Btoken(ki) = Mtoken(ki).
+(40)
+Candidates whose token preservation memory
+exceeds the total KV cache budget are discarded.
+For each feasible candidate, the remaining budget
+for layer-wise precision allocation is computed as:
+Blayer(ki) = B −Btoken(ki).
+(41)
+Given the remaining budget, the layer-wise allo-
+cation solver introduced in Section C.2 obtains the
+corresponding precision configuration:
+q∗(ki) = arg min
+q
+L
+X
+l=1
+Sl(ql),
+(42)
+subject to the layer-wise memory constraint.
+Each complete allocation candidate is evaluated
+using the collective surrogate objective:
+15
+
+J(ki) = Ltok(ki) +
+L
+X
+l=1
+Sl(q∗
+l (ki)).
+(43)
+The selected token preservation configuration is:
+k∗= arg min
+ki∈K J(ki),
+(44)
+which yields the final static precision policy:
+π∗= (q∗, k∗).
+(45)
+By jointly evaluating layer-wise precision en-
+hancement and token-wise preservation under the
+shared KV cache budget, MultiAlloc determines
+the cross-granularity allocation before inference.
+The resulting policy is fixed during deployment
+and requires no online allocation search.
+D
+Algorithm and Static Deployment
+Details
+D.1
+Offline Profiling Procedure
+The offline profiling stage collects the precision
+demand statistics required for subsequent budget-
+coupled allocation. Given a pretrained model f and
+calibration set Dcal, the procedure first obtains full-
+precision KV representations and their gradients
+through forward-backward passes. These interme-
+diate states are then reused to evaluate different
+quantization candidates without additional gradient
+computation.
+For each layer l and candidate bit-width b,
+the quantization perturbations are used to com-
+pute the layer-wise precision demand profile
+{Sl(b)}L
+l=1. Meanwhile, token importance scores
+sl,t = ∥Kl,t∥1 are collected as the token-level pro-
+filing trace, which is later used to evaluate different
+token preservation configurations.
+The complete offline profiling procedure is sum-
+marized in Algorithm 1. It outputs the layer-wise
+precision demand table and token-level profiling
+trace, which remain fixed during policy selection
+and inference.
+D.2
+Offline Policy Selection
+After obtaining the profiling statistics, the offline
+allocation stage constructs the final precision pol-
+icy under the target KV cache budget. Given the
+layer-wise precision demand table and token-level
+profiling trace, the procedure evaluates a finite
+Algorithm 1 Offline Profiling for Layer-wise Pre-
+cision Demand and Token-level Trace
+Require: Pretrained model f; calibration set Dcal;
+candidate bit-widths B; quantization operators
+{Qb(·)}b∈B
+Ensure: Layer-wise
+precision
+demand
+table
+{Sl(b)}; token-level profiling trace T
+1: Initialize Sl(b) ←0 for all l ∈{1, . . . , L} and
+b ∈B
+2: Initialize T ←∅
+3: for each calibration sample (xi, yi) ∈Dcal do
+4:
+Run one forward-backward pass on (xi, yi)
+5:
+Collect {Ki,l, Vi,l, GK
+i,l, GV
+i,l}L
+l=1
+6:
+for l = 1 to L do
+7:
+Append
+token
+scores
+{(i, l, t, ∥Ki,l,t∥1)}t to T
+8:
+for each b ∈B do
+9:
+Compute quantization perturba-
+tions:
+∆K(b)
+i,l = Qb(Ki,l) −Ki,l
+∆V (b)
+i,l = Qb(Vi,l) −Vi,l
+10:
+Update layer demand:
+Sl(b) ←Sl(b) + ∥∆K(b)
+i,l ⊙GK
+i,l∥1
++ ∥∆V (b)
+i,l ⊙GV
+i,l∥1
+11:
+end for
+12:
+end for
+13: end for
+14: for l = 1 to L do
+15:
+for each b ∈B do
+16:
+Sl(b) ←Sl(b)/|Dcal|
+17:
+end for
+18: end for
+19: return {Sl(b)} and T
+16
+
+set of token preservation configurations and de-
+termines their corresponding layer-wise precision
+assignments.
+For each candidate token configuration k, its
+memory consumption is first evaluated. Candidates
+that violate the total KV cache budget are discarded.
+For each feasible candidate, the remaining memory
+budget is assigned to layer-wise precision alloca-
+tion, and the corresponding layer-wise precision
+configuration is obtained using the solver described
+in Section C.2.
+The complete allocation procedure is summa-
+rized in Algorithm 2. The selected configuration
+minimizes the collective surrogate objective among
+all feasible candidates and produces the final static
+policy π∗= (q∗, k∗). Since all candidate evalua-
+tion and budget allocation are completed offline, no
+allocation search or budget adjustment is required
+during inference.
+D.3
+Static Inference Deployment
+Once the allocation policy π∗is obtained, it is di-
+rectly applied during inference. For each Trans-
+former layer l, the incoming KV states are quan-
+tized using the assigned bit-width q∗
+l .
+Mean-
+while, the token preservation configuration k∗de-
+termines the number of high-precision tokens re-
+tained within each token group.
+Although the identities of preserved tokens de-
+pend on the input sequence, the selection rule itself
+is fixed by the offline policy. Specifically, tokens
+are ranked using the predefined importance met-
+ric and preserved according to the assigned top-k
+capacity.
+During inference, the execution only involves
+deterministic KV quantization, token scoring, high-
+precision token preservation, and cache mainte-
+nance. No profiling, gradient computation, candi-
+date policy enumeration, budget optimization, or
+dynamic precision reallocation is performed online.
+By separating allocation decisions from latency-
+critical inference, MultiAlloc applies a fixed pre-
+cision policy during deployment and avoids any
+additional allocation search under the target KV
+cache memory constraint.
+E
+Additional Allocation Analysis
+We further analyze the precision allocation policies
+generated by MultiAlloc across different model ar-
+chitectures, parameter scales, and workloads. The
+goal of this analysis is to understand how the pro-
+Algorithm 2 Collective Allocation under a Fixed
+KV Cache Budget
+Require: Layer-wise precision demand table
+{Sl(b)}; token-level profiling trace T ; total
+KV cache budget B; candidate token configu-
+rations K
+Ensure: Static precision policy π∗= (q∗, k∗)
+1: Initialize J∗←+∞
+2: Initialize q∗←∅; k∗←∅
+3: for each token configuration ki ∈K do
+4:
+Compute token preservation memory:
+Btoken(ki) ←Mtoken(ki)
+5:
+if Btoken(ki) > B then
+6:
+Continue
+7:
+end if
+8:
+Compute remaining layer budget:
+Blayer(ki) ←B −Btoken(ki)
+9:
+Obtain layer-wise precision configuration:
+q(ki) ←LAYERALLOCATION
+({Sl(b)}, Blayer(ki))
+10:
+if q(ki) = ∅then
+11:
+Continue
+12:
+end if
+13:
+Compute collective surrogate objective:
+J(ki) ←Ltok(ki) +
+L
+X
+l=1
+Sl(ql(ki))
+14:
+if J(ki) < J∗then
+15:
+J∗←J(ki)
+16:
+k∗←ki
+17:
+q∗←q(ki)
+18:
+end if
+19: end for
+20: return π∗= (q∗, k∗)
+17
+
+posed profiling-guided allocation adapts limited
+KV cache resources under different deployment
+conditions.
+E.1
+Layer-wise Precision Allocation Patterns
+Figures 5 and 6 present the layer-wise KV cache
+precision configurations under different models and
+memory budgets. Each heatmap visualizes the as-
+signed bit-width of individual Transformer layers
+derived from the profiling-guided allocation pro-
+cess.
+As shown in Figures 5 and 6, the allocated preci-
+sion levels exhibit clear layer-wise variation rather
+than a uniform configuration across all Transformer
+layers. Layers with larger quantization-induced
+degradation receive higher precision candidates,
+while other layers are assigned lower precision to
+satisfy the target memory constraint.
+The allocation patterns further vary across model
+scales and workloads, indicating that layer-wise
+precision demand is not determined solely by layer
+depth or model architecture.
+Therefore, fixed
+or manually designed layer-wise precision poli-
+cies cannot consistently capture the heterogeneous
+quantization requirements under different deploy-
+ment settings.
+E.2
+Token Preservation Allocation Patterns
+Figures 7 and 8 analyze how the available token
+preservation capacity is distributed across Trans-
+former layers under different models and work-
+loads.
+Unlike layer-wise precision allocation, token
+preservation introduces an additional sparse allo-
+cation dimension, where only a subset of tokens
+receive extra high-precision storage. As shown in
+Figures 7 and 8, the preservation capacity is not uni-
+formly distributed across layers. Instead, different
+layers receive different preservation capacities ac-
+cording to their estimated token-level preservation
+demands.
+The allocation patterns further vary across mod-
+els and workloads, indicating that the benefit of
+additional high-precision storage depends on both
+model characteristics and task distributions. There-
+fore, a fixed preservation ratio or manually prede-
+fined token allocation policy cannot consistently
+capture the heterogeneous token-level precision de-
+mands under different KV cache constraints.
+E.3
+Fixed Split versus Adaptive Allocation
+To further examine the necessity of budget cou-
+pling, we compare MultiAlloc with manually spec-
+ified memory splits between layer-wise precision
+enhancement and token preservation.
+A fixed split allocates a predefined proportion of
+the KV cache budget to each precision preservation
+strategy, regardless of the underlying model char-
+acteristics, workload, or target memory constraint.
+However, the appropriate allocation between the
+two dimensions may vary across different deploy-
+ment settings.
+As shown in Table 3, different manual split ratios
+result in distinct performance trade-offs. Although
+a manually selected ratio can achieve competitive
+performance in certain settings, no fixed split con-
+sistently provides the best allocation across the eval-
+uated configurations.
+In contrast, MultiAlloc determines the budget
+distribution between layer-wise precision enhance-
+ment and token preservation through offline profil-
+ing and budget-coupled optimization. By avoiding
+manually predefined budget partitioning, the pro-
+posed allocation strategy better adapts the limited
+KV cache memory to heterogeneous precision de-
+mands under different deployment constraints.
+F
+Complexity Analysis
+We analyze the computational overhead of Multi-
+Alloc by separating the one-time offline allocation
+cost from the inference-time execution cost. The
+allocation process is performed entirely before de-
+ployment, and inference only applies the resulting
+static precision policy without additional search.
+F.1
+Offline Complexity
+The offline stage consists of precision demand pro-
+filing and budget-coupled policy selection. Let
+Ncal denote the number of calibration samples, L
+the number of Transformer layers, T the profiling
+sequence length, DKV the KV representation di-
+mension, |B| the number of candidate bit-widths,
+and |K| the number of token preservation candi-
+dates.
+For each calibration sample, one forward-
+backward pass is performed to obtain the KV rep-
+resentations and their gradients. The collected in-
+termediate states are reused to evaluate different
+quantization candidates, leading to the profiling
+complexity:
+18
+
+0
+4
+8
+12
+16
+20
+24
+28
+31
+Layer index
+GSM8K
+GPQA
+LB-v2
+2
+4
+8
+KV precision (bits)
+(a) Mistral-7B-Instruct-v0.3 under a 431 MB KV cache budget.
+0
+4
+8
+12
+16
+20
+24
+27
+Layer index
+GSM8K
+GPQA
+LB-v2
+2
+4
+8
+KV precision (bits)
+(b) DeepSeek-R1-Distill-Qwen-7B under a 180 MB KV cache
+budget.
+Figure 5: Layer-wise KV cache precision allocation patterns on the evaluated 7B models. The assigned bit-widths
+vary across layers according to the profiled precision demands under fixed KV cache budgets.
+0
+4
+8
+12
+16
+20
+24
+28
+32
+36
+40
+44
+47
+Layer index
+GSM8K
+GPQA
+LB-v2
+2
+4
+8
+KV precision (bits)
+(a) DeepSeek-R1-Distill-Qwen-14B under a 620 MB KV cache
+budget.
+0
+4
+8
+12
+16
+20
+24
+28
+32
+36
+40
+44
+48
+52
+56
+60 63
+Layer index
+GSM8K
+GPQA
+LB-v2
+2
+4
+8
+KV precision (bits)
+(b) QwQ-32B under an 820 MB KV cache budget.
+Figure 6: Layer-wise KV cache precision allocation patterns on larger-scale models. The distinct distributions
+demonstrate model-dependent precision demands and the necessity of profiling-guided allocation.
+O (NcalCfb(T) + NcalL|B|TDKV ) ,
+(46)
+where Cfb(T) denotes the cost of one forward-
+backward pass.
+After profiling, the allocation stage evaluates
+different token preservation candidates. For each
+candidate, the remaining memory budget is allo-
+cated to layer-wise precision selection through the
+solver described in Section C.2. The overall offline
+allocation complexity is:
+O
+
+|K|NcalLT + L|B| ˆB
+
+,
+(47)
+where ˆB denotes the discretized memory capac-
+ity used by the dynamic programming solver.
+Both the candidate bit-width set and token preser-
+vation candidate set are constructed offline and
+remain small in practice. Therefore, the alloca-
+tion overhead is incurred only once for each target
+model, calibration configuration, and KV cache
+budget.
+F.2
+Inference-Time Complexity
+After offline optimization, inference directly ap-
+plies the precomputed static policy
+π∗= (q∗, k∗).
+(48)
+During decoding, each Transformer layer quan-
+tizes the incoming KV states using the assigned
+bit-width q∗
+l , while token preservation follows the
+fixed capacity configuration specified by k∗.
+The online execution only performs determinis-
+tic cache operations, including KV cache quantiza-
+tion, token scoring, high-precision token preserva-
+tion according to the fixed policy, and cache main-
+tenance. No profiling, candidate enumeration, dy-
+namic programming, budget search, or precision
+reallocation is performed during inference.
+When the token group size and preservation ca-
+pacity are bounded, the additional computation in-
+troduced by the allocation policy is O(LDKV ) per
+generated token. This cost is independent of the
+size of the offline candidate space and the target
+KV cache budget.
+Therefore, MultiAlloc separates the allocation
+overhead from latency-critical inference by resolv-
+ing all precision decisions offline, enabling effi-
+cient deployment under fixed KV cache memory
+constraints.
+19
+
+0
+4
+8
+12
+16
+20
+24
+28
+31
+Layer index
+GSM8K
+GPQA
+LB-v2
+21
+1
+1
+1
+1 1
+1
+8
+5
+6 1
+2
+3 2
+1
+12
+7 2 5
+1
+1
+0
+5
+10
+15
+21
+Outliers per group
+(a) Mistral-7B-Instruct-v0.3 under a 431 MB KV cache budget.
+0
+4
+8
+12
+16
+20
+24
+27
+Layer index
+GSM8K
+GPQA
+LB-v2
+3
+3
+6
+1
+5
+4
+6
+9
+8
+1
+5
+1
+7
+4
+5
+5
+3
+1
+2
+4
+2
+3
+1
+1
+2
+4
+4
+2
+4
+3
+2
+1
+1
+1
+1
+3
+5
+2
+6
+2
+1
+1
+1
+0
+2
+4
+6
+8
+Outliers per group
+(b) DeepSeek-R1-Distill-Qwen-7B under a 180 MB KV cache
+budget.
+Figure 7: Token preservation capacity allocation patterns on the evaluated 7B models. The available preservation
+budget is distributed non-uniformly across layers according to the profiled token-level preservation demands.
+0
+4
+8
+12
+16
+20
+24
+28
+32
+36
+40
+44
+47
+Layer index
+GSM8K
+GPQA
+LB-v2
+6
+1 2 2 3 1 1
+8
+1
+2 2 1
+1
+1
+6
+1 2
+2 2
+1
+2
+0
+2
+4
+6
+8
+Outliers per group
+(a) DeepSeek-R1-Distill-Qwen-14B under a 620 MB KV cache
+budget.
+0
+4
+8
+12
+16
+20
+24
+28
+32
+36
+40
+44
+48
+52
+56
+60 63
+Layer index
+GSM8K
+GPQA
+LB-v2
+10
+1 2
+1
+1
+1
+5
+3
+1
+1
+1 2 2
+1
+7
+1
+1
+1 1
+3 7 5 3
+2 1 3
+1 2
+2 3 3 1 3 4 5 3 1
+1 2
+3 1 2 4 1 3
+0
+2
+4
+6
+8
+10
+Outliers per group
+(b) QwQ-32B under an 820 MB KV cache budget.
+Figure 8: Token preservation capacity allocation patterns on larger-scale models. The distributions vary across
+models and tasks, indicating workload-dependent token-level preservation demands under fixed KV cache budgets.
+20

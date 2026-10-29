@@ -1,0 +1,2099 @@
+Simulate Before You Scale: High-Fidelity LLM Inference
+Planning Without GPUs
+DIPANWITA GUHATHAKURTA∗, IBM Research, USA
+MERT TOSLALI∗†, IBM Research, USA
+SRINIVASAN PARTHASARATHY∗, IBM Research, USA
+JING CHEN, IBM Research, USA
+MICHAEL KALANTAR, IBM Research, USA
+NICHOLAS A. MASLUK, IBM Research, USA
+VISHAKHA RAMANI, IBM Research, USA
+ASSER TANTAWI, IBM Research, USA
+FABIO OLIVEIRA, IBM Research, USA
+Deploying large language model (LLM) inference at scale requires jointly selecting hardware layout, parallelism
+strategy, scheduling policy, admission control, and request routing to meet latency and throughput targets.
+These choices interact: a routing decision that improves cache locality can concentrate load, and an admission
+threshold that triggers only at saturation allows queues to grow deep enough to degrade critical-tier traffic.
+Evaluating candidates on GPU clusters is too expensive for iterative exploration, yet existing predictive tools
+either ignore batching and queueing dynamics or model only fragments of the pipeline. In this paper, we
+present BLIS, a deterministic, CPU-only discrete-event simulator that models the full inference serving pipeline
+(admission, routing, scheduling, prefill/decode execution, KV-cache management, and preemption). BLIS pairs
+analytical basis functions with learned scaling coefficients and overhead terms, fit once globally, to predict step
+latency without per-model or per-GPU profiling. Across 36 experiments spanning six models and three GPU
+types, BLIS achieves 6.7% median end-to-end error while running around 200× faster than real execution. In a
+configuration search over 420 serving configurations for Llama-2-70B, BLIS identifies a 4-GPU deployment
+that meets a 300 ms mean TTFT service-level objective (SLO), whereas competing tools either require double
+the GPUs or recommend configurations that fail under load. Two policies evolved entirely in simulation were
+validated on real hardware and merged into llm-d, a widely adopted open-source platform for distributed LLM
+serving: an admission policy that reduces critical-tier TTFT P90 by up to 82%, and a flow-control policy that
+reduces E2E P50 latency by 32–48% on overloaded workloads.
+CCS Concepts: • Computing methodologies →Discrete-event simulation; Modeling and simulation; •
+General and reference →Performance.
+Additional Key Words and Phrases: LLM inference serving; latency modeling; performance prediction; config-
+uration search; admission control; tensor parallelism; KV-cache management
+∗These authors contributed equally to this work.
+†Corresponding author.
+This is the preprint version of our paper accepted at ACM SIGMETRICS 2027.
+Authors’ Contact Information: Dipanwita Guhathakurta, IBM Research, Yorktown Heights, NY, USA, dipanwita.
+guhathakurta3@ibm.com; Mert Toslali, IBM Research, Cambridge, MA, USA, toslali@ibm.com; Srinivasan Parthasarathy,
+IBM Research, Yorktown Heights, NY, USA, spartha@us.ibm.com; Jing Chen, IBM Research, Yorktown Heights, NY, USA,
+Jing.Chen2@ibm.com; Michael Kalantar, IBM Research, Yorktown Heights, NY, USA, kalantar@us.ibm.com; Nicholas
+A. Masluk, IBM Research, Yorktown Heights, NY, USA, namasluk@us.ibm.com; Vishakha Ramani, IBM Research,
+Yorktown Heights, NY, USA, vishakharamani@ibm.com; Asser Tantawi, IBM Research, Yorktown Heights, NY, USA,
+tantawi@us.ibm.com; Fabio Oliveira, IBM Research, Yorktown Heights, NY, USA, fabolive@us.ibm.com.
+This work is licensed under a Creative Commons Attribution 4.0 International License.
+arXiv:2610.14255v1  [cs.PF]  9 Oct 2026
+
+2
+Guhathakurta et al.
+Fig. 1. BLIS-only multi-objective configuration search over 1,100 serving configurations for Llama-2-70B on
+H100 GPUs, evaluated in minutes on a CPU. Each point is one configuration; bold markers trace the Pareto
+frontier per GPU budget tier (2, 4, and 6–8 GPUs). The search jointly optimizes throughput and TTFT P99
+across arrival-rate sweeps. The four-tool comparison in §5 uses a 420-configuration subset of this space with
+mean TTFT as the shared metric.
+1
+Introduction
+Deploying a large language model (LLM) inference platform requires choosing routing policies,
+admission behavior, batching settings, and KV-cache reuse strategies under concrete time-to-first-
+token (TTFT), inter-token latency (ITL), throughput, and cost constraints [23, 52]. These choices are
+coupled. A routing policy that improves prefix-cache hit rates can concentrate load on a subset of
+instances; a chunk size that helps one workload can hurt another; an admission policy that sheds load
+too late lets queues grow deep enough to degrade the traffic it protects. Teams must predict these
+coupled effects before committing GPU capacity or promoting a change to production. Confirming
+these tradeoffs reliably means measuring them on a GPU cluster: one workload evaluation (e.g.,
+10,000 requests at 10 requests per second (rps) served by Llama-2-70B on NVIDIA H100 [37] nodes)
+takes roughly 18 minutes of sustained GPU time, plus provisioning, download, and warm-up. A
+meaningful exploration repeats this across hundreds of configurations, policies, and workloads, so
+the aggregate cost, not any single run, makes broad exploration impractical.
+A simulator that faithfully reproduces these coupled dynamics without requiring GPUs is useful
+in two scenarios. The first is configuration search: sweeping hardware budgets and serving-stack
+parameters to identify configurations worth deploying on real hardware. Figure 1 illustrates: BLIS
+drives a multi-objective search over 1,100 candidate configurations for Llama-2-70B on H100 GPUs,
+jointly optimizing throughput and TTFT P99 across three GPU budget tiers (2, 4, and 6–8 GPUs)
+with arrival-rate sweeps. The four-tool comparison in §5 uses a 420-configuration subset of this
+space with mean TTFT as the shared metric, since not all tools predict tail percentiles. By simulating
+per-request queueing and scheduling, BLIS predicts tail-latency percentiles (P90, P99) that closed-
+form estimators cannot (validated against ground truth in §4.5). The search reveals that throughput
+plateaus well before tail latency degrades, and that the optimal operating point differs by tier.
+The second is policy evolution: exploring routing, admission, and batching alternatives before
+investing the engineering effort to implement and validate candidates on a GPU cluster. Evaluating
+policy variants (an admission curve that sheds load under saturation, a routing weight that rewards
+
+Simulate Before You Scale: High-Fidelity LLM Inference Planning Without GPUs
+3
+prefix-cache reuse, a chunk size that governs prefill/decode interleaving) across workload suites is
+routine in serving-system development, and each evaluation on a GPU cluster takes hours. With a
+simulator, broad exploration happens locally on a CPU, and cluster validation is reserved for the
+small set of policies or configurations that simulation identifies as worth the cluster time.
+Existing tools occupy different points in an accuracy, cost, and coverage tradeoff, and each
+addresses a subset of this problem (§2). Benchmarks such as inference-perf [22] and GuideLLM [36]
+run the real system and define ground truth, but evaluate one configuration at a time, so exploration
+cost scales linearly with the number of candidates. Closed-form estimators such as llm-optimizer [8]
+predict without profiling but ignore continuous batching, KV-cache pressure, and queueing, mis-
+predicting by 20–90% under load; execution-modeling tools such as Vidur [1], AIConfigurator [48],
+and LLMServingSim [13] model execution more faithfully (median error 17–619%, highest outside
+the regime each was calibrated for) but depend on profiling and cannot cover hardware absent
+from their profiled set without a fresh calibration run. These tools leave two gaps, which motivate
+our two technical contributions. First, accuracy and generalization are in tension: predicting a
+new model or GPU without re-profiling requires a latency model derived from architectural and
+hardware specifications, with coefficients fit once, not re-fit per configuration. Second, the stages of
+the serving pipeline (admission, batching, queueing) are coupled: each shapes the load the others
+see. A tool that models them in isolation, or reasons only about steady-state averages, cannot
+reproduce the load-dependent dynamics (§2.2); capturing them at speed without GPUs requires
+simulating the pipeline end to end.
+We present BLIS, a deterministic, CPU-only discrete-event simulator [7] that addresses this
+problem through three contributions:
+(1) Concept. BLIS introduces a latency model combining roofline-inspired [45] basis functions
+with learned, architecture-aware parameters. The model is fit once across a set of models,
+GPUs, and tensor-parallelism (TP) configurations; new models (dense or mixture-of-experts),
+new GPU types and new TP configurations are then predicted without re-profiling. (§3)
+(2) System. BLIS realizes a full-pipeline, coupled discrete-event simulation spanning admission,
+routing, scheduling, prefill/decode execution, KV-cache management, and preemption, with
+a validation methodology for systematic comparison against real-cluster measurements.
+(§4)
+(3) Evidence. We show that BLIS is accurate and fast:
+• Fidelity: BLIS reproduces measured latency within 6.7% median error across 36 experi-
+ments (six models, three GPU types, multiple configurations), nearly 200× faster than
+real execution. (§4)
+• Configuration search: BLIS explores hundreds of configurations in minutes to identify
+candidate Pareto-optimal deployments per GPU budget tier. We validate top recom-
+mendations from all four tools (BLIS and three baselines: Vidur, AIConfigurator, and
+LLM-Optimizer) on an 8×H100 cluster; BLIS’s recommendations meet the latency SLO
+while a closed-form estimator’s configuration fails catastrophically under load. (§5)
+• Real-world impact: Two policies evolved entirely in simulation were validated on real
+hardware and merged upstream into llm-d1: an admission policy that reduces critical-
+tier TTFT P90 by up to 82% under overload, and a flow-control policy that reduces E2E
+P50 by 32–48% on overloaded workloads by proportionally throttling lower-priority
+traffic. (§6)
+BLIS’s accuracy comes from pairing these first two contributions. An architecture- and hardware-
+aware latency model, whose coefficients are shared and fit once across 15 real-system experiments,
+1https://llm-d.ai
+
+4
+Guhathakurta et al.
+drives a full-pipeline discrete-event simulation of the coupled queueing and batching dynamics.
+Together they capture both hardware-aware step latency and load-dependent serving behavior,
+whereas closed-form estimators predict latency without simulating how batch composition and
+queue depth evolve under load, and profiled-operator simulators reproduce those dynamics but
+require a calibration run per new model, GPU, or configuration (§3.3).
+BLIS is open-source, with documentation at https://inference-sim.github.io/inference-sim/latest/;
+the code is available at https://github.com/inference-sim/inference-sim/releases/tag/v0.9.2.
+2
+Background and Motivation
+Selecting and tuning an LLM serving deployment requires evaluating candidates far faster and more
+cheaply than real-cluster experiments permit (§1). A simulator can occupy this role only if it satisfies
+three properties at once: fidelity, reproducing the latency and throughput operators optimize for;
+speed, evaluating a configuration quickly so it can sit inside a search loop; and composability,
+accepting substitutions of individual policies (admission, routing, scheduling) without internal
+modification. Human operators and automated agents rely on the simulator as a deterministic
+fitness function: identical inputs must yield identical predictions, so an outcome change reflects
+policy or configuration, not simulation noise (§6). This section establishes the structure of the
+modeled system (§2.1), characterizes the coupled dynamics that make its behavior hard to predict
+(§2.2), reviews gaps in existing tools (§2.3), and distills the requirements (§2.4).
+2.1
+The LLM Serving Pipeline
+An LLM serving instance generates each response autoregressively in two phases with distinct
+performance characteristics. The prefill phase processes the full input prompt in parallel and is
+compute-bound; the decode phase then produces output tokens one at a time, and because each step
+reads the entire key-value (KV) cache from GPU memory, it is memory-bound [23]. The KV cache
+stores the attention state for every token generated so far. It is allocated in fixed-size blocks and
+grows with sequence length, so an instance’s finite GPU memory bounds the number of requests it
+can serve concurrently [23]. To raise utilization, modern engines use continuous batching [49]. A
+step is one model forward pass over the current batch, producing one token for every decoding
+request. All requests in a batch share a single forward pass, so per-step latency is governed by its
+most expensive operation: a large prefill co-scheduled with many decodes raises the latency of
+every request in the step. Chunked prefill, as in Sarathi-Serve [2], splits long prefills into smaller
+units interleaved with decode steps to bound this effect. When the KV cache saturates, the engine
+preempts running requests and frees their blocks; a preempted request must later recompute or
+reload its evicted KV state before it can resume [23].
+At cluster scale, a deployment comprises many such instances behind a shared admission and
+routing layer. Admission control gates incoming requests, a router selects a target instance for
+each admitted request (using policies such as load balancing or prefix-aware placement), and
+per-instance scheduling orders the local wait queue. Disaggregated deployments further split
+the prefill and decode phases across separate instance pools so that each can be provisioned and
+scaled independently [52]. These admission and routing decisions operate on periodic snapshots of
+instance state (queue depth, KV-cache utilization, in-flight count) that are stale: by the time one is
+acted upon, the state it describes may already have changed, particularly under shifting load.
+2.2
+Why Modeling Is Hard: Coupled Dynamics
+This pipeline is hard to predict because its components are coupled: a perturbation in one stage
+propagates through others via load-dependent feedback. We group these into three mechanisms.
+
+Simulate Before You Scale: High-Fidelity LLM Inference Planning Without GPUs
+5
+Cross-request coupling. Requests in a batch share one forward pass, so a step costs the maximum
+over its operations, not their average. One long prefill chunk stalls every decode it shares a step
+with, an effect chunked prefill bounds but does not remove [2]. Continuous batching changes this
+composition every step, so per-request latency depends on the entire arrival pattern, not isolated
+requests. Steady-state analysis, which assumes a fixed or average batch, misses it.
+KV-cache cascades. Memory pressure couples requests through a feedback loop: when the KV
+cache fills, the engine preempts running requests [23], and recomputing their evicted state on
+re-admission adds load that raises pressure further. One large request entering a nearly full instance
+can thus cascade into preemptions that degrade many co-located requests; the effect is non-linear
+in load, absent below the memory limit and growing with the number of evictions beyond it.
+Stale-snapshot feedback. At cluster scale, admission, routing, and flow-control decisions act on
+the stale snapshots of §2.1, creating feedback of their own. When several requests arrive within one
+snapshot interval, a load-balancing router sends them all to the instance that looks least loaded; the
+resulting overload raises its latency, yet the stale snapshot keeps attracting traffic until it refreshes,
+and saturation thresholds lag for the same reason. Because these loops interact, a deployment’s
+behavior depends on the joint configuration of its policies, not any one alone.
+These dynamics determine whether latency targets are met. The default admission controller in
+a widely adopted serving platform [31] admits all traffic until cluster saturation reaches its limit,
+then sheds sheddable-tier (lower-priority) requests outright; because that threshold fires only once
+queues are deep and the KV cache nearly full, critical requests admitted just before it suffer elevated
+TTFT from contention with queued sheddable traffic, a cliff that proactive shedding removes (§6).
+2.3
+Existing Approaches
+Existing tools occupy different points in a tradeoff among accuracy, cost, and coverage, and each
+rests on assumptions that bound which of the dynamics in §2.2 it can reproduce.
+Benchmarks. Tools such as inference-perf [22] and GuideLLM [36] run the real system and report
+ground-truth measurements, but they measure rather than predict and exploring an alternative
+policy requires redeploying the system under test. They serve as the reference against which
+predictive tools are validated.
+Closed-form estimators. They predict latency and throughput analytically rather than by simu-
+lating execution. llm-optimizer [8] includes an estimator that works from hardware specifications,
+requiring no profiling of the target model or GPU. Its estimator reasons about isolated requests
+and static bottlenecks at a fixed, steady-state operating point, and ignores continuous batching,
+KV-cache pressure, or queueing.
+Simulators. They model the system’s execution more directly but differ in both scope and method:
+discrete-event simulators (Vidur, LLMServingSim) advance through individual request-arrival and
+batch-step events and so reproduce queueing and batch dynamics, whereas steady-state estimators
+(AIConfigurator) compute latency analytically at a fixed operating point without unrolling those
+events. Vidur [1] simulates a cluster of replicas behind a global request router and predicts per-
+operator runtimes with a random-forest model fit per (model, GPU, TP) configuration, so TP
+communication is absorbed into the profiled operator times rather than simulated explicitly. Its
+replica scheduler follows Sarathi-Serve [2], a vLLM fork whose chunked-prefill scheduling and KV-
+cache management differ from current production engines; it does not model admission control or
+prefill/decode disaggregation. AIConfigurator [48] profiles individual operators (GEMM, attention,
+communication, MoE) per GPU type and precision into a performance database, then composes
+the interpolated operator times for a given architecture and tensor-parallel degree to estimate
+end-to-end latency; it explicitly models prefill/decode disaggregation. As a steady-state estimator it
+
+6
+Guhathakurta et al.
+Table 1. Predictive approaches to LLM serving evaluation trade off accuracy, cost, and coverage, and each
+models a subset of the serving pipeline, which bounds the dynamics (§2.2) it can reproduce. “Profiling required”
+is the calibration granularity: “per config” a run per (model, GPU, TP), “per GPU” a run per GPU type and
+precision, “once” a single global fit for all configurations, and “none” no fit. BLIS alone pairs a latency model
+needing only a one-time global fit with a coupled full-pipeline simulation and composable policies.
+LLM-Optimizer
+[8]
+Vidur
+[1]
+AIConfigurator
+[48]
+LLMServingSim
+[13]
+BLIS
+Latency model
+analytical
+profiled
+profiled
+profiled
+analytical
++ learned
+Tail latency (P90/P99)
+no
+yes
+no
+yes
+yes
+Profiling required
+none
+per config
+per GPU
+per config
+once
+Composable policies
+none
+limited
+none
+limited
+full
+computes latency at a fixed concurrency, so it does not capture how batch composition and queue
+depth evolve under load, and falls back to speed-of-light estimates for hardware absent from the
+database. InferSim [5] takes the same profiled-operator approach and likewise omits cluster-level
+queueing, so AIConfigurator represents this class in our evaluation. LLMServingSim 2.0 [13] extends
+the original [14] to heterogeneous and disaggregated infrastructure; we evaluate 2.0 (§4). Both
+model multi-instance serving with profiled kernel timings, request routing, and KV-cache pressure
+handled by swapping blocks to host memory, and, unlike Vidur, simulate inter-GPU communication
+and its overlap with compute explicitly rather than folding it into the kernel profiles; neither
+models admission control or queue-full rejection. Each tool captures a subset of the pipeline; in our
+evaluation their median end-to-end error spans 17% to 619% (§4), reaching the upper end outside
+the regime a tool was calibrated for. Vidur and LLMServingSim require re-profiling for each new
+model, GPU, or TP, restricting coverage to already-profiled configurations; AIConfigurator profiles
+only per GPU type and precision, deriving unseen models and parallelism degrees analytically, but
+cannot cover a GPU absent from its database.
+2.4
+Design Requirements
+The dynamics of §2.2 and the gaps in §2.3 together impose four requirements on a simulator
+intended to support configuration search and policy evolution.
+(1) End-to-end coupled simulation (R1). The simulator must model the full pipeline as
+interacting components rather than isolated stages, to represent emergent effects such as
+preemption cascades and routing-induced overload (§2.2).
+(2) Generalization without per-configuration profiling (R2). It must predict latency for
+new (model, GPU, TP) combinations from architectural parameters, without re-running
+calibration for every configuration.
+(3) Composable policy interfaces (R3). Each policy axis (admission, routing, scheduling)
+must be replaceable independently and without modifying the simulator core, so that both
+manual sweeps and automated search can substitute candidate policies.
+(4) Fast, deterministic execution (R4). A run must advance through simulated events rather
+than wall-clock time, so that hours of serving replay in seconds on a CPU, and must produce
+identical output for a given seed, so that the simulator can serve as a stable fitness function
+for iterative optimization.
+Section 3 addresses each requirement: R1 through the coupled simulation pipeline, R2 through the
+latency model, R3 through pluggable interfaces, and R4 through CPU-only deterministic execution.
+
+Simulate Before You Scale: High-Fidelity LLM Inference Planning Without GPUs
+7
+DATA PLANE
+ENGINE INSTANCE
+Admission
+control
+gate or shed on
+cluster load
+Routing
+weighted scorers:
+prefix affinity,
+queue depth,
+KV-cache
+utilization
+Batch
+formation
+continuous
+batching, chunked
+prefill
+KV-cache
+management
+block allocation,
+preemption and
+recompute
+Step
+execution ★
+prefill and decode
+phases
+routed
+to
+instance
+×𝑁
+instances
+cluster scope
+instance scope
+Admission & routing policy
+Scheduling & batch-formation policy
+★latency model (§3.2) replaces the GPU forward pass
+Fig. 2. Layered architecture of BLIS. Each layer exposes a single policy interface; the engine layer replaces
+GPU step execution with the latency model and is otherwise structurally identical to a real instance.
+3
+System Design
+BLIS is organized so that each of the four requirements of §2.4 is met by a distinct part of the design:
+the architecture and execution core (§3.1, R4) grounds the rest; the latency model (§3.2, R2) is the
+central novelty, and §3.3 describes how its shared coefficients are fit once and why the pairing
+of this model with simulation is the source of BLIS’s accuracy; the simulation pipeline (§3.4, R1)
+couples the components end to end; and the policy interfaces (§3.5, R3) make admission, routing,
+and scheduling independently replaceable.
+3.1
+Overview
+BLIS models an LLM serving deployment as two layers that mirror the structure of a production
+stack (§2.1). The engine layer executes batches on a single instance: it forms batches, manages
+the KV cache, and advances token generation. The data plane admits requests and routes them to
+instances. Each layer exposes the serving behavior it governs through a policy interface (§3.5), so a
+deployment is described by the policies plugged into each layer, not by changes to the simulator.
+The implementation and experiments are grounded at the engine layer in vLLM [23], the most
+widely adopted open-source single-instance LLM serving engine, and at the data plane in llm-d [31],
+an open-source project for distributed LLM serving built on vLLM; both are representative of
+production deployments. Figure 2 shows the two layers and the policy interface exposed at each.
+The only departure from a real deployment is the engine’s execution step: where a production
+instance runs the forward pass on a GPU, BLIS substitutes the latency model of §3.2, otherwise
+reproducing the same control flow.
+Discrete-event execution. BLIS advances by event rather than by fixed time step. The simulator
+maintains a single timeline of scheduled events (request arrival, step completion, snapshot refresh,
+preemption) and processes them in timestamp order, advancing the simulated clock directly to
+the next event. A snapshot refresh republishes each instance’s load signals (queue depth, KV-cache
+utilization, batch size) to the routing and admission layer, which act on these periodically refreshed
+snapshots rather than live instance state (§3.4). A run therefore costs work proportional to the
+number of events rather than the wall-clock duration simulated, replaying hours of serving in
+seconds on a CPU (R4). This is the standard discrete-event simulation (DES) method [7]; our
+contribution is applying it to the coupled serving dynamics of §2.2 that a steady-state model misses.
+Algorithm 1 summarizes the loop and shows where each layer of the architecture acts on an event.
+Separating mechanism from policy. The code is split into two layers that correspond to this dis-
+tinction. A simulation kernel provides the discrete-event machinery: the event queue, the simulated
+
+8
+Guhathakurta et al.
+Algorithm 1 BLIS discrete-event simulation loop.
+1: Initialize event queue 𝑄as a min-heap on (𝑡, priority, seq)
+2: Seed each subsystem’s RNG; enqueue request arrivals
+3: while 𝑄is not empty do
+4:
+𝑒←pop earliest event from 𝑄; advance clock to 𝑒.𝑡
+5:
+if 𝑒is an arrival then
+6:
+data plane: admission, then routing to an instance
+7:
+else if 𝑒is a step completion then
+8:
+engine: form batch, manage KV cache, call latency model (§3.2)
+9:
+enqueue the next step if work remains
+⊲work-conserving
+10:
+else if 𝑒is a snapshot refresh then
+11:
+publish instance state to the data plane
+⊲stale-signal feedback
+12:
+else if 𝑒is a preemption then
+13:
+free KV blocks and mark victims for recomputation
+14:
+end if
+15: end while
+clock, partitioned random-number generation, and statistics collection. It is agnostic to LLM-serving
+specifics, ordering and dispatching events unchanged across GPUs, models, and configurations.
+A set of domain modules (router, scheduler, KV-cache manager, latency model, batch-formation
+logic) encodes all inference-serving behavior. These modules hold the domain knowledge while
+consuming and producing events, so a new policy (§3.5) is introduced by implementing one module
+without touching the kernel.
+Determinism. The event queue is a min-heap keyed on (timestamp, priority, sequence identifier),
+with cluster-level ties broken by lowest instance index, and randomness is partitioned per subsystem
+so no stochastic component perturbs another’s event order. A given seed thus produces byte-
+identical output across runs (R4), as manual sweeps and automated search require to use the
+simulator as a fitness function (§6).
+3.2
+Latency Model
+The latency model predicts the execution time of one batch step and is what lets BLIS generalize to
+unprofiled (model, GPU, TP) configurations (R2). Prior simulators obtain step time by profiling,
+requiring a calibration run before predicting on a new model, GPU, or parallelism degree (§2.3).
+BLIS instead expresses step time as a closed-form function of model architecture (hidden dimension,
+layer and head counts, intermediate dimension, expert count, quantization precision), hardware
+specifications (peak FLOP/s, HBM bandwidth), and parallelism degree, all read from a model’s
+published config.json and the GPU’s datasheet.
+Model structure. The latency model is built in two layers. The first computes closed-form roofline
+bounds [45] at the granularity of a whole forward-pass step, as in Splitwise [39] and DistServe [52]:
+a compute bound divides an operation’s floating-point operations 𝐹by the GPU’s peak throughput
+𝑃, and a memory bound divides the bytes moved 𝑀by the relevant bandwidth, HBM bandwidth𝑊
+on-device and interconnect bandwidth 𝑊net across shards. Each basis function therefore carries
+units of time: a compute term divides operations by operations per second, and a memory term
+divides bytes by bytes per second. Six basis functions cover the dominant costs of a step, grouped
+
+Simulate Before You Scale: High-Fidelity LLM Inference Planning Without GPUs
+9
+by phase: prefill (pf), decode (dc), weight loading, and tensor-parallel (tp) communication:
+𝑇pf
+comp = 𝐹pf/𝑃,
+𝑇pf
+kv = 𝑀pf
+kv/𝑊,
+𝑇weight = 𝑀w/𝑊,
+𝑇dc
+comp = 𝐹dc/𝑃,
+𝑇dc
+kv = 𝑀dc
+kv/𝑊,
+𝑇tp = 𝑀tp/𝑊net.
+(1)
+The two prefill terms (𝑇pf
+comp, 𝑇pf
+kv) cover prompt processing, including the KV-cache write; the
+two decode terms (𝑇dc
+comp, 𝑇dc
+kv ) cover token generation, where reading the accumulated context
+dominates bandwidth. Weight loading (𝑇weight) is incurred once per step, since a single forward
+pass serves the whole batch [23], and 𝑇tp is the all-reduce across shards. Attention compute follows
+FlashAttention’s IO-aware accounting [15], where new tokens attend within on-chip SRAM so
+that only past context contributes HBM traffic; quantization and grouped-query attention enter
+through the same parameters, the effective bytes per parameter and the key-value head count.
+The second layer closes the gap between these peak bounds and observed execution time, where
+real kernels run below peak through memory access patterns, launch overhead, synchronization, and
+scheduling. Scaling the roofline by fixed per-phase utilization factors, the conventional analytical
+approach, cannot track how this gap shifts with batch composition and load; BLIS therefore learns
+the scaling from end-to-end traces rather than fixing it, a choice we isolate empirically in §4.4. It
+combines the basis functions with learned scaling coefficients and additive overhead terms that
+capture costs the roofline omits:
+𝑇step = 𝛽1𝑎𝑇pf
+comp + 𝛽1𝑏𝑇pf
+kv + 𝛽2𝑎𝑇dc
+comp + 𝛽2𝑏𝑇dc
+kv
++ 𝛽3𝑇weight + 𝛽4𝑇tp + 𝛽5𝐿+ 𝛽6𝐵+ 𝛽7 + 𝛽8𝑛MoE,
+(2)
+where 𝐿is the number of layers, 𝐵the batch size, and 𝑛MoE the number of interleaved mixture-
+of-experts (MoE) layers. The first four coefficients (𝛽1𝑎–𝛽2𝑏) are dimensionless scaling factors
+that absorb the gap between peak and observed throughput, fit once across all configurations
+rather than set per GPU. The remaining terms are fixed overheads the roofline does not model:
+a per-layer cost (𝛽5, kernel launches and normalization), a per-request cost (𝛽6, scheduling and
+mask construction), a per-step constant (𝛽7, synchronization and sampling), and a per-MoE-layer
+cost (𝛽8). Because 𝐿, 𝐵, and 𝑛MoE are dimensionless counts, 𝛽5–𝛽8 carry units of time, so every term
+in Equation 2 contributes a time. Three further coefficients (𝛼0–𝛼2) account for per-request CPU
+and framework overhead: request ingestion (𝛼0), detokenization (𝛼1), and per-token streaming (𝛼2).
+All coefficients are shared and fit once jointly across diverse (model, GPU, TP) configurations by
+Bayesian optimization from end-to-end latency traces, with no operator-level profiling (Appendix F).
+The decomposition in Equation 2 doubles as a check on whether the fit reflects the underlying
+behavior or merely absorbs error. Each phase carries both a compute and a memory term, but by
+the roofline only one should bind: prefill is compute-bound and decode memory-bound, so the
+prefill-memory (𝛽1𝑏) and decode-compute (𝛽2𝑎) terms should carry no weight. The fit confirms this,
+leaving the prefill-compute and decode-memory factors as the only active terms; it thus recovers
+the roofline regime rather than spreading weight across all terms, indicating that the physics prior
+carries the prediction, and the overhead terms take interpretable values (Appendix F).
+Generalization. Because the basis functions depend only on published parameters and the coeffi-
+cients are shared, an unprofiled model, GPU, or TP requires no calibration run: BLIS substitutes the
+new parameters into the same equations and applies the existing coefficients. We use the full form
+by default; §4 evaluates its accuracy across unprofiled models, GPUs, and parallelism degrees.
+3.3
+Fitting the Model
+BLIS’s accuracy comes from pairing the latency model of §3.2, whose coefficients are fit once across
+real-system experiments, with the full-pipeline simulation of §3.1, which advances the coupled
+
+10
+Guhathakurta et al.
+dynamics of §2.2 rather than a steady-state average. Existing tools supply one element but not
+both (§2.3). Closed-form estimators predict from specifications but do not simulate load-dependent
+dynamics, while profiled-operator simulators reproduce those dynamics but require a calibration
+run per new model, GPU, or configuration. This subsection describes how the shared coefficients
+are obtained.
+Training data. The coefficients are fit on 15 ground-truth experiments collected from vLLM
+deployments on H100 GPUs, each recording per-request TTFT, end-to-end latency, inter-token
+latency, and throughput under a multi-stage workload profile with controlled arrival rates and
+token-length distributions. The experiments span six model families (Llama-2-7B, Llama-3.1-70B,
+Llama-4-Scout-17B-16E, Mistral-Nemo-12B, Qwen2.5-7B, Yi-34B), three architectural classes (dense,
+grouped-query attention, and interleaved mixture-of-experts with FP8 quantization), and tensor-
+parallelism degrees of 1, 2, and 4. This diversity forces the coefficients to generalize: a single fit must
+hold for dense models where the MoE terms vanish, MoE models where the interleave overhead
+dominates, single-GPU deployments where the TP term is zero, and multi-GPU deployments
+where communication cost is significant. No evaluation model (§4) appears in the fitting set
+by design. The evaluation models differ in parameter count from their training counterparts (for
+example, Llama-2-70B against the training set’s Llama-2-7B), and three families (Mixtral, CodeLlama,
+Qwen3) are absent from training entirely, while two GPU types (A100, L40S) are used only in
+evaluation. The accuracy reported in §4 therefore reflects out-of-distribution generalization rather
+than interpolation within the training regime (§4 enumerates the evaluation models and Appendix G
+the full configuration set).
+Two-loop procedure. The fit separates what the model computes (its structure) from how well it
+fits (its coefficients) through two nested loops, summarized in Algorithm 2. The outer loop evolves
+the model structure: examining per-experiment residuals from the previous iteration, identifying
+a systematic error (for example, MoE underprediction), and hypothesizing a structural change
+(adding the MoE overhead term 𝛽8, correcting a basis function, or splitting a combined term). The
+inner loop holds the structure fixed and searches for the coefficients that minimize the loss
+L = RMSE
+
+APE(TTFT𝑖)
+
++ RMSE
+
+APE(E2E𝑖)
+
+,
+(3)
+where TTFT𝑖and E2E𝑖are the mean TTFT and end-to-end latency for experiment 𝑖and the RMSE
+is taken over the 15 per-experiment absolute-percentage-error (APE) values. Taking the RMSE
+across experiments penalizes variance: a model accurate on one architecture but not another
+incurs high loss even when its mean error is low, so the fit is pushed toward coefficients that
+hold across the training diversity rather than favoring any one configuration. The inner loop
+selects its optimizer by search-space dimensionality and iteration maturity. Early iterations use
+TPE Bayesian optimization [9] via Optuna [4] for high-dimensional exploration (up to 2,000 trials
+over all coefficients jointly); as the structure stabilizes and the search narrows, it shifts to CMA-
+ES [18] for joint multi-parameter refinement and golden-section search [20] for one-dimensional
+polish of individual coefficients, and late iterations combine the three in a pipeline (CMA-ES for
+global exploration, TPE warm-started with prior trials, golden section for final convergence). In all
+cases, coefficients are bounded to physically motivated ranges and warm-started from the previous
+outer iteration. Separating the loops keeps structural changes motivated by physics rather than by
+overfitting: the inner loop cannot mask a missing term by distorting other coefficients, because the
+per-experiment residuals expose where the model form itself is inadequate.
+What the fit recovers. The converged coefficients are physically interpretable rather than opaque.
+As §3.2 notes, the prefill-memory (𝛽1𝑏) and decode-compute (𝛽2𝑎) scaling factors fit to zero, so
+the fit recovers the roofline regime (compute-bound prefill, memory-bound decode) rather than
+
+Simulate Before You Scale: High-Fidelity LLM Inference Planning Without GPUs
+11
+Algorithm 2 Two-loop latency-model fitting.
+1: Input: initial model structure 𝑓0, training experiments {𝐸1, . . . , 𝐸15}
+2: Output: final structure 𝑓∗and coefficients (𝛼∗, 𝛽∗)
+3: for each outer iteration 𝑘= 1, 2, . . . do
+⊲Structural evolution
+4:
+Examine per-experiment errors from iteration 𝑘−1
+5:
+Identify systematic residuals (e.g., MoE underprediction)
+6:
+Hypothesize structural change →new model form 𝑓𝑘
+7:
+Define coefficient search bounds B𝑘
+8:
+Select optimization strategy
+⊲Inner loop
+9:
+for each candidate (𝛼, 𝛽) ∈B𝑘proposed by optimizer do
+10:
+Instantiate the latency model with 𝑓𝑘and (𝛼, 𝛽)
+11:
+Run BLIS on all 15 experiments in parallel
+12:
+Compute L = RMSE[APE(TTFT𝑖)] + RMSE[APE(E2E𝑖)]
+13:
+end for
+14:
+(𝛼∗
+𝑘, 𝛽∗
+𝑘) ←arg min L
+15:
+if loss converged then break
+16: end for
+17: return (𝑓𝑘, 𝛼∗
+𝑘, 𝛽∗
+𝑘)
+spreading weight across redundant terms. The additive overheads take values consistent with their
+physical sources on H100: tens of microseconds per layer (𝛽5, kernel launches and normalization),
+a few microseconds per request (𝛽6, scheduling and mask construction), on the order of a hundred
+microseconds per step (𝛽7, synchronization and sampling), and hundreds of microseconds per
+interleaved MoE layer (𝛽8). That these independently fit values land in plausible ranges indicates
+the physics prior, not the free parameters, carries the prediction (full coefficient roles in Appendix F).
+Why the fit transfers without retraining. The coefficients are shared across all configurations,
+and the only architecture-dependent component is the basis functions (Equation 1), computed
+from the published HuggingFace config.json and the GPU datasheet. An unprofiled model, GPU,
+or TP degree is thus handled by evaluating the same basis functions on its published parameters,
+with no re-fitting; a genuinely new architecture class (for example, sliding-window or multi-head
+latent attention) needs only an added basis term and a re-run of the inner loop, leaving existing
+coefficients valid. The fit therefore requires only public inputs, with no operator-level profiling,
+kernel tracing, or model weights (Appendix F).
+3.4
+Simulation Pipeline
+The pipeline carries a request from arrival to completion through the layers of §3.1, and its coupling
+is what makes BLIS an end-to-end simulation rather than a sequence of independent stages (R1).
+Figure 9 (Appendix H) traces this lifecycle and marks the snapshot feedback path from instance
+state back to the routing and admission layer that drives the feedback loops of §2.2.
+Engine layer. At an instance, an admitted request enters a wait queue ordered by the scheduling
+policy (first-come-first-served, priority, or shortest-job-first). Batch formation then admits requests
+from the wait queue up to the configured limits on running requests and scheduled tokens, allocating
+KV-cache blocks for each. When the KV cache cannot satisfy a new allocation, the policy preempts
+running requests to free blocks, selecting victims by arrival order or priority. A preempted request
+
+12
+Guhathakurta et al.
+must later recompute its evicted KV state before resuming, exactly the cascade described in §2.2.
+Step execution calls the latency model of §3.2 on the formed batch, advances the clock by the
+predicted step time, and schedules the next step. Long prompts are split across steps by chunked
+prefill [2], interleaving a large prefill with ongoing decodes rather than stalling them in one step.
+The engine maintains a work-conserving invariant: if the wait queue is non-empty after a step
+completes, a subsequent step is always scheduled, so the instance never idles while work is pending.
+Data plane. At cluster scale, a request first passes admission control, which may gate or shed it
+based on the current router view of cluster load. Admission policies range from admitting all traffic
+to saturation-based flow control. An admitted request is then routed by a scorer framework that
+combines weighted signals (queue depth, KV-cache utilization, prefix affinity, and load balance)
+into a per-instance score, the same composition used by the production llm-d router [31]. These
+decisions read periodically refreshed snapshots of instance state (queue depth, KV utilization, batch
+size, in-flight count) rather than instantaneous truth, reproducing the staleness-induced feedback of
+§2.2. A cluster-level event queue orchestrates the per-instance queues so that this coupling across
+instances is simulated rather than approximated.
+Workload generation. The pipeline is driven by one of three workload sources. Synthetic work-
+loads draw arrivals from a configurable process (Poisson, gamma, Weibull, or constant) with prompt-
+and output-length distributions and per-request SLO tiers (critical, standard, sheddable). Trace
+replay reissues captured request traces with either their original timing or simulation-computed
+timing. Closed-loop session workloads model multi-turn conversations in which each follow-up
+arrives a think-time after the previous response completes.
+3.5
+Pluggable Policy Interfaces
+The composability requirement (R3) is met by exposing each policy axis as a single interface that
+the simulation core calls but does not implement. Admission decides whether to admit or shed
+a request; routing selects a target instance through the weighted scorer composition above; the
+instance scheduler orders the wait queue before batch formation; and batch formation governs
+the preemption strategy and batch composition. A new policy along any axis is introduced by
+implementing the corresponding interface, without changing the kernel or the other modules, so
+both manual sweeps and automated search can substitute candidates freely. The routing interface
+mirrors the llm-d production abstraction directly: a deployment composes named, weighted scorers
+(for example prefix-affinity:2, queue-depth:1, kv-utilization:1) exactly as in the real
+system [31], so a policy studied in simulation transfers to production without reimplementation.
+Determinism (R4) makes comparing two policies a controlled experiment: with the same workload
+and seed, the only difference between runs is the policy under test. This interface structure supports
+both the configuration sweeps of §5 and the policy evolution of §6.
+4
+Accuracy Study
+We aim to answer three questions: (1) Does BLIS generalize across models, hardware, and workloads
+without per-model or per-GPU profiling runs? (2) Where does it sit on the accuracy-speed tradeoff
+relative to existing tools? (3) Under what conditions does it break, and why? We describe the setup
+(§4.1), compare tools head-to-head (§4.2), analyze the accuracy-speed tradeoff (§4.3), ablate BLIS’s
+modeling choices (§4.4), and characterize failure modes (§4.6).
+4.1
+Experimental Setup
+Models. We select six models spanning dense and MoE architectures, 8B–141B parameters, and
+distinct attention mechanisms: four dense models (Llama-3.1-8B, Qwen3-14B, CodeLlama-34B,
+
+Simulate Before You Scale: High-Fidelity LLM Inference Planning Without GPUs
+13
+and Llama-2-70B) and two MoE models (Mixtral-8x7B, 47B total/13B active; Mixtral-8x22B, 141B
+total/39B active). None of these six models appears in the training set used to fit BLIS’s coefficients;
+the two sets are disjoint by design (§3.3), so the evaluation tests generalization to unseen parameter
+counts and model families within the dense (multi-head and grouped-query attention) and mixture-
+of-experts transformer classes BLIS covers (§3.2).
+Hardware. Experiments run on three NVIDIA GPU types spanning distinct memory-bandwidth,
+compute, and interconnect profiles: H100-80GB SXM (NVLink), A100-80GB SXM (NVLink), and
+L40S (48 GB, PCIe), testing whether the latency model generalizes across hardware generations
+without per-GPU re-profiling.
+Workloads. Each experiment replays a fixed request trace against the real system and all simula-
+tors. Token-length distributions come from ServeGen [47], which regenerates request shapes from
+production serving traces, and arrival timing from the Azure LLM inference trace [33]. Drawing
+shapes and arrivals from separate production sources lets each reflect measured behavior, with
+skewed length distributions that stress scheduling fidelity beyond synthetic workloads. We in-
+stantiate four workload profiles at arrival rates of 4–20 rps, differing primarily in token-length
+distribution: general-purpose (input ≈550, output ≈250 tokens), codegen (input ≈570, output ≈250
+tokens), roleplay (input ≈750, output ≈250 tokens, longer system prompts), and reasoning (input
+≈1,030, output ≈1,450 tokens), which is far more decode-heavy, stressing KV-cache capacity and
+producing longer queue-drain tails. All workloads use multi-stage load profiles (stages at different
+arrival rates) and contain 10.4k requests on average.
+Configurations. vLLM exposes serving parameters controlling the compute/memory tradeoff:
+chunk size (max_num_batched_tokens) sets how many prefill tokens run per step, and thus
+how often prefill and decode interleave; GPU memory utilization sets the KV-cache budget;
+and CPU offloading extends the scheduler’s memory hierarchy. The baseline configuration for
+each model uses the minimum viable tensor-parallel degree, max_num_batched_tokens=2048,
+gpu_memory_utilization=0.9, and CPU offloading disabled; from this baseline we sweep one
+knob at a time: tensor-parallel degree ∈{1, 2, 4, 8}, max_num_batched_tokens ∈{1024, 2048, 8192},
+gpu_memory_utilization ∈{0.9, 0.95}, and KV-cache CPU offloading (on/off).
+Baselines. We compare against four tools whose capabilities are summarized in Table 1; for each,
+we note only the setup specific to our evaluation.
+• Vidur [1]: we use only its natively shipped profiles (no additional profiling), which ex-
+clude MoE architectures and limit hardware and model coverage. Its scheduler follows
+pre-chunked-prefill vLLM semantics structurally incompatible with modern vLLM v1, a
+gap re-profiling alone cannot bridge (Appendix D).
+• LLMServingSim [13]: it ships profiling data only for the RTX PRO 6000, so for our H100,
+A100-80GB, and L40S targets we profiled all models with its built-in profiler. Its cycle-
+accurate simulation gives high architectural fidelity at proportionally higher runtime cost,
+constraining the request volume we can simulate.
+• AIConfigurator [48]: we supply model architecture, hardware type, and precision, and read
+latency from the produced throughput-versus-latency Pareto frontiers.
+• LLM-Optimizer [8]: evaluates in sub-second time and approximates MoE models as dense.
+BLIS and Vidur replay full per-request traces. LLM-Optimizer and AIConfigurator are steady-state
+estimators that do not natively accept request-rate inputs; we derive their concurrency parameters
+via throughput-matching (Appendix C), whose discretization residual (mean 8.7% and 12.3%) is
+well below their latency prediction error, so the translation is not the source of their inaccuracy.
+LLMServingSim runs its cycle-level simulator with the analytical ASTRA-Sim backend [46] on a
+
+14
+Guhathakurta et al.
+proportionally sampled 1,000-request subset per experiment, since the full 10k+ request workloads
+are infeasible at cycle granularity, and is compared against vLLM ground truth on that subset.
+Ground truth and metrics. Ground-truth measurements are collected using inference-perf [22]
+on vLLM v0.15.1 [23] (which runs the V1 engine architecture) serving deployments across all three
+GPU types. All experiments completed successfully with zero failed requests. To characterize the
+real system’s intrinsic noise floor, we repeated a subset of ground-truth experiments three times
+(independent replicas on the same cluster, spanning 4–40 rps across three workload profiles). The
+coefficient of variation (CV) across replicas is below 5% for median E2E and below 6% for E2E P90
+at moderate arrival rates (4–15 rps), and median ITL remains stable across all rates (median CV
+<4%); CV rises at higher arrival rates (16–40 rps) where queueing effects amplify scheduling-order
+perturbations. A single ground-truth measurement is therefore a stable reference for the operating
+points where the accuracy study concentrates. We record per-request time-to-first-token (TTFT),
+inter-token latency (ITL), and end-to-end (E2E) latency. The primary accuracy metric is mean
+absolute percentage error (MAPE):
+MAPE = 1
+𝑁
+𝑁
+∑︁
+𝑖=1
+
+ˆ𝑦𝑖−𝑦𝑖
+𝑦𝑖
+ × 100%
+(4)
+where ˆ𝑦𝑖is the simulator’s prediction and 𝑦𝑖is the measured value for experiment 𝑖. We report E2E
+MAPE as the primary metric and include TTFT and ITL breakdowns where they reveal distinct
+behavior. The evaluation comprises 36 experiments in total, enumerated in Appendix G; across
+them, BLIS achieves 6.7% median E2E MAPE, and predicts E2E P90 and P99 latency with 7.5% and
+9.2% median error (§4.5).
+4.2
+Head-to-Head Comparison
+We compare all tools across the full experiment set, slicing results along four axes: model archi-
+tecture, GPU type, workload type, and configuration knobs. Each tool predicts accurately only
+within the regime it models, so we report prediction error where a tool is in-regime and identify
+configurations that fall outside it rather than counting them as latency-model error.
+Accuracy across models. Figure 3 reports per-tool MAPE across six models on H100 under
+baseline parameters (§4.1). BLIS shows the lowest E2E error on four of the six models and the
+lowest TTFT error on five of the six. AIConfigurator is moderately accurate where it runs and
+strongest on ITL, where its analytical time-per-output-token model matches the decode-bound
+regime and edges BLIS on three models. Vidur runs only the four dense models; where it does, its
+TTFT error exceeds 10,000% because it emulates an older vLLM scheduler without chunked prefill,
+modeling prefill as one blocking step rather than interleaved chunks. This gap reflects applicability
+to vLLM v1 rather than the accuracy of Vidur’s latency model, and is structural (Appendix D).
+LLM-Optimizer’s E2E error is moderate on dense models (20–50%) but rises to ≈90% on MoE, where
+its single-request closed-form estimate approximates MoE routing as dense.
+Accuracy across hardware. Figure 4 groups experiments by GPU (baseline parameters, general-
+purpose workloads). Because BLIS’s coefficients are fit only on H100 (Appendix F), its A100 and
+L40S results measure cross-GPU generalization with no per-GPU re-profiling. Median E2E MAPE
+is 5.5% on H100 and 15.7% and 13.3% on the unprofiled A100 and L40S, so BLIS predicts GPUs it
+was never calibrated on from datasheet parameters alone, without a per-GPU profiling run. BLIS
+has the lowest E2E error on H100 and A100 and the lowest TTFT error on all three GPUs. On L40S,
+AIConfigurator edges it on E2E (11.5% vs 13.3%) and ITL. LLM-Optimizer errors are uniformly high
+because its peak-spec roofline misses per-GPU efficiency differences under batched serving.
+
+Simulate Before You Scale: High-Fidelity LLM Inference Planning Without GPUs
+15
+Fig. 3. Per-tool MAPE across six models on H100 (E2E, TTFT, ITL). Vidur’s shipped profiles exclude MoE; its
+TTFT overprediction reflects a structural scheduler mismatch with vLLM v1 (Appendix D), not latency-model
+error.
+Fig. 4. Per-tool MAPE grouped by GPU type (mbt=2048, gpu_mem=0.9, offloading off; general-purpose work-
+loads). Vidur ships profiles for only a subset of models on A100 and none on L40S.
+Accuracy across workloads. Figure 5 reports median MAPE for up to four workload types
+across Llama-3.1-8B, Qwen3-14B, and Mixtral-8x22B (H100, baseline parameters). BLIS stays below
+10% median E2E MAPE on general-purpose, code generation, and roleplay, rising to 25% on the
+decode-heavy reasoning workload, whose longer input and output sequences amplify KV-cache
+pressure, prefill-chunk scheduling, and queue-drain tails. LLM-Optimizer and AIConfigurator
+degrade on code generation and reasoning because their concurrency-based models cannot capture
+how sequence-length distribution shapes batch composition and step-time variance.
+Accuracy across configurations. Sweeping one knob at a time (TP degree, chunk size, GPU
+memory utilization, KV-cache offloading) on H100 for a dense model (Llama-3.1-8B) and an MoE
+model (Mixtral-8x7B), BLIS achieves the lowest E2E MAPE at the baseline and most configurations,
+whereas LLM-Optimizer and AIConfigurator ignore chunk size, offloading, and memory utilization,
+predicting identically across configurations. The full per-knob breakdown appears in Appendix A
+(Figure 8).
+
+16
+Guhathakurta et al.
+Fig. 5. Per-tool MAPE for up to four workload types across Llama-3.1-8B, Qwen3-14B, and Mixtral-8x22B
+(H100, mbt=2048, gpu_mem=0.9, offloading off). Vidur excluded (no profiled coefficients for these models).
+Fig. 6. Accuracy versus speed: median runtime (s) versus median MAPE (%) on log-log axes. Error bars show
+interquartile range. LLMServingSim is evaluated on a 1,000-request subset (§4.1), so its runtime is not directly
+comparable to the full-trace tools.
+4.3
+Accuracy-Speed Tradeoff
+Accuracy alone does not determine practical value: per-evaluation speed sets whether exhaustive
+search is tractable. Figure 6 plots median MAPE against median wall-clock runtime per simulator
+on log-log axes across all experiments. LLM-Optimizer evaluates in 0.1 s by eliminating queueing
+simulation, but its analytical estimates cannot capture batch-composition and scheduling effects,
+at substantially higher error. BLIS occupies the low-error, moderate-speed region: slower than
+estimation-based tools but scheduling-aware. LLMServingSim’s cycle-accurate fidelity costs runtime
+exceeding real execution, and Vidur shows the highest median error among the dense configurations
+it runs (§4.2). Exact per-tool runtimes and speedups appear in Appendix B (Table 3).
+4.4
+Ablations
+We ablate the learned component of the latency model (§3.2) to quantify the accuracy it adds over
+a purely analytical baseline.
+
+Simulate Before You Scale: High-Fidelity LLM Inference Planning Without GPUs
+17
+Fig. 7. Trained-physics versus roofline configuration per model, showing E2E, TTFT (log scale), and ITL MAPE.
+The learned scaling and overhead terms reduce error across all models, with the largest gains on TTFT.
+Roofline versus trained-physics. The roofline configuration uses the same analytical basis
+functions (Equation 1) but scales them by fixed Model-FLOPs-Utilization (MFU) factors rather
+than learned coefficients. These factors are set per phase and GPU from published utilization
+benchmarks [21, 42, 43] (details in Appendix E). No overhead terms (𝛽5–𝛽8, 𝛼0–𝛼2) are included;
+this configuration requires no training. The trained-physics configuration is the full model used by
+default: it replaces the fixed MFU factors with the learned scaling coefficients (𝛽1𝑎–𝛽4) and additive
+overhead terms (𝛽5–𝛽8) of Equation 2, together with the per-request overheads (𝛼0–𝛼2), fit once
+across a training set of (model, GPU, TP) configurations (Appendix F).
+Figure 7 compares the two across all six models on E2E, TTFT, and ITL. The roofline configuration
+systematically under-predicts latency: its fixed MFU factors miss load-dependent overheads from
+kernel launches, memory bank conflicts, and communication stalls. The gap is starkest on TTFT (log
+scale), where roofline incurs >100% MAPE on most models while trained-physics stays substantially
+lower; it widens on models with more overhead relative to compute, namely CodeLlama-34B and
+Llama-2-70B (longer memory-bound prefills). The same coefficients are shared across models
+without re-fitting, since the captured overhead sources are common across architectures.
+4.5
+Tail-Latency Accuracy
+By simulating per-request queueing and scheduling, BLIS predicts tail percentiles (P90, P99) that
+closed-form estimators cannot, and on which the search objectives of §5 depend. Across the 36
+experiments, BLIS predicts E2E latency to a median MAPE of 6.7% at the mean, 7.5% at P90, and
+9.2% at P99; TTFT to 17.6% at the mean, 21.3% at P90, and 29.0% at P99; and ITL to 7.1% at the mean
+(inference-perf reports mean ITL only, so ITL has no tail percentiles). Most of the tail error comes
+from decode-heavy reasoning experiments (§4.6).
+4.6
+Failure Modes
+We identify two conditions under which BLIS’s accuracy degrades.
+Reasoning workloads. The reasoning workload (input ≈1,030, output ≈1,450 tokens) is BLIS’s
+hardest regime (25% median E2E MAPE): small per-step timing differences compound over ∼1,450
+decode iterations, so the simulated scheduling order drifts from reality as long decode sequences
+hold KV-cache memory and reshape batch-admission timing.
+
+18
+Guhathakurta et al.
+All-reduce contention. BLIS’s analytical all-reduce bandwidth model under-estimates NVLink
+contention when concurrent batches compete for bandwidth. On the dense model (Llama-3.1-8B),
+E2E MAPE rises from 2.5% at TP=1 to 15.5% at TP=2 (Appendix A). The effect is model-dependent
+rather than monotonic in TP: on Mixtral-8x7B higher parallelism reduces error, while Mixtral-8x22B
+(TP=8), where all-reduce, expert-dispatch, and memory-footprint errors compound, reaches 12.5%
+E2E MAPE on the general-purpose baseline versus 6.0% for Mixtral-8x7B.
+5
+Configuration Search
+Deploying an LLM requires jointly choosing tensor-parallelism degree, replica count, batch limits,
+chunk size, and scheduling, routing, and admission policies: conservative choices over-provision
+hardware, aggressive ones violate latency SLOs under load. This space is combinatorially large,
+and validating each candidate on hardware means provisioning GPUs and running a sustained
+load test, making exhaustive evaluation prohibitively slow. BLIS supports tail-latency objectives
+(P90, P99) and arrival-rate sweeps as first-class search dimensions, enabling the multi-objective
+exploration shown in Figure 1.
+We compare four tools’ ability to search this space for Llama-2-70B on H100 GPUs under a
+shared-prefix code-generation workload, and validate their top recommendations on real hardware.
+We choose Llama-2-70B because all four tools natively support it, aligning the search space as
+closely as possible across tools. We use llm-d [31] as the deployment platform because it exposes
+the full parameter surface under test (admission control, routing policy, and vLLM serving con-
+figuration) through a unified API. We evaluate BLIS, Vidur, AIConfigurator, and LLM-Optimizer;
+LLMServingSim is excluded because it provides no search algorithm and its per-configuration
+runtime is too slow for practical search (§4.3). The four tools differ in how they model latency and
+what profiling they require, as summarized in Table 1.
+All four tools search TP ∈{2, 4, 8} and derive replica counts from the GPU budget; Vidur’s
+profiling data does not cover TP=8, restricting its effective search to TP ∈{2, 4}. For parameters a tool
+determines internally (batch sizes, concurrency levels, scheduler caps), we use each tool’s own logic
+rather than imposing external values. BLIS pairs its simulator with a multi-objective search driven by
+a declarative YAML specification; an operator targeting a different workload or SLO changes only the
+spec file. The search space spans topology, batching (max_num_seqs, max_num_batched_tokens),
+scheduling, routing, admission, and preemption policy (420 configurations, 8 parallel workers). The
+search optimizes three objectives (maximize throughput, minimize mean TTFT, minimize GPU
+count) subject to TTFTmean ≤300 ms and GPU count ≤8. We use mean TTFT rather than a tail
+percentile so that all four tools can be compared on the same metric; BLIS and Vidur additionally
+predict P90/P99, but AIConfigurator and LLM-Optimizer produce only mean estimates.
+Of BLIS’s 420 configurations, 373 are feasible under the SLO; the Pareto frontier reduces to 2
+operating points (TP=4×1 at 4 GPUs, TP=8×1 at 8 GPUs), confirming that topology dominates at
+moderate utilization. We deploy each tool’s top-2 Pareto configurations (8 total) on H100 GPUs
+running llm-d under constant 5 rps arrival (5,000 requests, mean input/output 566/247 tokens).
+Table 2 reports predicted and measured performance. The central result is a feasibility separation:
+BLIS identifies a 4-GPU topology (TP=4×1) that meets the 300 ms SLO (96 ms and 112 ms measured
+TTFT, 100% completion), whereas Vidur’s pre-chunked-prefill scheduler rejects TP=4×1 and requires
+8 GPUs to produce a feasible recommendation ($25.60/hr versus $12.80/hr). Among scheduling-
+aware tools, BLIS’s chunked-prefill model enables a 2× hardware reduction.
+AIConfigurator’s 4-GPU recommendation (TP=2×2) measures 732 ms mean TTFT; TP=2 provides
+insufficient prefill parallelism, saturating at 5 rps. Its 6-GPU recommendation meets the SLO. LLM-
+Optimizer’s configurations fail catastrophically (mean TTFT exceeding 450 s, 12–48% completion):
+the tool’s own search recommends max_num_seqs≤8, but the workload’s steady-state concurrency
+
+Simulate Before You Scale: High-Fidelity LLM Inference Planning Without GPUs
+19
+Table 2. Each tool’s top-2 recommended configurations with predicted and measured performance. Deployed
+on H100 GPUs running llm-d under constant 5 rps arrival (5,000 requests). SLO: ≤300 ms mean TTFT. Com-
+pleted denotes the fraction of requests that finished before a 30-minute deadline (arrivals span 1,000 s; a
+well-provisioned deployment drains all requests well within this window). Note the GPU column: Vidur’s low
+measured TTFT comes at 8 GPUs ($25.60/hr), double the cost of BLIS’s 4-GPU recommendation ($12.80/hr).
+Vidur cannot produce a feasible 4-GPU configuration because its scheduler does not model chunked prefill.
+Tool
+TP×Replicas
+GPUs
+max_seqs
+Mean TTFT (ms)
+Completed
+SLO
+Pred.
+Meas.
+BLIS
+4×1
+4
+64
+46
+96
+100%
+✓
+BLIS
+4×1
+4
+256
+46
+112
+100%
+✓
+Vidur
+4×2
+8
+64
+188
+74
+100%
+✓
+Vidur
+4×2
+8
+256
+190
+124
+100%
+✓
+AICfg
+2×2
+4
+20
+188
+732
+100%
+×
+AICfg
+2×3
+6
+20
+188
+132
+100%
+✓
+LLMOpt
+2×1
+2
+4
+284
+453,677
+12%
+×
+LLMOpt
+4×1
+4
+8
+284
+463,963
+48%
+×
+at 5 rps is ≈28 requests in flight, so the low batch limit causes unbounded queue growth. This failure
+reflects the tool’s single-request model, which does not account for queueing under continuous
+load, rather than an artifact of our concurrency translation (Appendix C derives only the latency-
+prediction input, not the configuration recommendation).
+The critical capability this experiment isolates is distinguishing feasible from infeasible con-
+figurations under load, not prediction accuracy on feasible ones. This experiment uses a single
+model/GPU/workload combination (Llama-2-70B, H100, code generation) because the accuracy
+study (§4) already establishes prediction generalization across six models, three GPU types, and four
+workloads; the purpose here is to demonstrate that accurate simulation translates into correct feasi-
+bility rankings in a search setting, which requires end-to-end hardware validation of recommended
+configurations rather than additional breadth. The prediction gap on BLIS’s own recommendations
+does not affect ranking because all TP=4 candidates predict identically, but non-monotonic errors
+could in principle prevent a Pareto frontier from transferring to hardware.
+6
+Policy Evolution
+Beyond predicting a deployment’s latency, BLIS enables policy evolution: iterating toward better
+serving policies by evaluating candidates in simulation before committing GPU time. We demon-
+strate this with two case studies, an admission-control and a flow-control policy, each evolved
+and evaluated entirely in simulation, validated on a real cluster, and merged upstream into the
+open-source serving platform [31].
+6.1
+Why Policy Evolution Requires BLIS
+BLIS models the coupled dynamics of distributed LLM serving and exposes each policy axis
+(admission, routing, scheduling) as a pluggable interface mirroring a distributed inference stack: a
+deployment composes named, weighted scorers as in llm-d [31], so a policy studied in simulation
+transfers smoothly. This makes BLIS a suitable inner loop for a policy-evolution workflow in which
+human operators or AI agents explore, evaluate, and refine serving policies.
+
+20
+Guhathakurta et al.
+Existing tools (§2.3) either omit admission and routing or do not expose them as replaceable
+interfaces, so introducing a new policy requires modifying simulation internals.
+The admission-control problem. An admission controller decides, per request, whether to admit
+or shed it. The default policy admits all requests until the cluster saturation signal reaches a threshold,
+then sheds all sheddable-tier requests outright. Per-instance saturation𝑠𝑖= max( queue_depth
+max_queue , kv_used
+kv_total)
+is the larger of two normalized utilizations (queue depth and KV-cache occupancy); the cluster-level
+signal is the average 𝑠= 1
+𝑁
+Í
+𝑖𝑠𝑖across 𝑁instances.
+This binary threshold fires only at deep queues and near-full KV caches, so critical-tier requests
+admitted just before it suffer elevated TTFT from contention with queued sheddable traffic (§2.2). A
+policy shedding sheddable traffic gradually, before the threshold, protects critical-tier latency. The
+design space spans the shedding-curve shape, the saturation definition, and threshold parameters.
+Simulation-driven policy evolution. Evolving a better policy on real hardware is impractical:
+a single workload evaluation on a GPU cluster takes 17–42 minutes (measured on H100 nodes
+running Qwen3-14B with 10,000 requests), and evaluating many candidate policies across multiple
+workloads multiplies this cost. In BLIS the same evaluation completes in seconds.
+We drove the evolution with Nous [3], an open-source agentic framework that proposes candidate
+implementations, measures their effect, and refines the next candidate from the outcome. Each
+candidate admission policy and workload was evaluated with BLIS as the evolution backend. The
+workflow applies equally to a human expert; we use an AI agent to exercise the loop.
+BLIS’s determinism (§3.5, R4) makes each run a controlled experiment: with the same workload
+and seed, the only difference between two runs is the policy under test. The evolution exploited
+this by testing each candidate across multiple seeds and workloads, catching failure modes (for
+example, excessive shedding at low load) that a single-workload evaluation would miss.
+The objective was to reduce critical-tier latency relative to the default policy by at least 30%,
+subject to an efficiency constraint (latency reduction per shed request) that discourages shedding
+without a corresponding latency benefit. The entire loop, 10 iterations comprising over 60 simulation
+runs across agent-designed workloads, completed in approximately 75 minutes of wall-clock time,
+of which BLIS consumed 7.5 minutes, the rest in agent reasoning and policy integration.
+The discovered policy. Early iterations revealed a tension: aggressive shedding reduced latency at
+moderate load but shed excessively at low load. The agent identified that the shape of the shedding
+curve, rather than signal smoothing, separates these regimes. The resulting policy, the probabilistic
+admitter, is defined per request. Requests in critical tiers are always admitted. A sheddable request
+is shed with probability
+𝑝shed(𝑠) = min 300𝑠5, 1 .
+(5)
+The high exponent concentrates shedding near saturation: approximately 1% at𝑠=0.12, 29% at𝑠=0.25,
+and full shedding as 𝑠approaches 0.32, replacing the binary threshold with a graded response.
+In simulation, across the agent-designed workload suite (blinded validation workloads, to avoid
+overfitting to a specific traffic mix), the probabilistic admitter reduced critical-tier TTFT by 17–37%
+(mean) and 19–44% (P90), and E2E latency by 17–46% (mean and P90), relative to the default policy.
+Real-cluster validation. We validated the policy on Qwen3-14B served by vLLM [23] on four
+NVIDIA H100-80GB SXM GPUs routed through llm-d, comparing the default policy against the
+probabilistic admitter on two workload profiles from the llm-d benchmarking testbed [30] (code
+completion: 2K input / 128 output tokens, 30% critical / 70% sheddable; interactive chat: 4K input /
+1K output tokens, 80% critical / 20% sheddable), each at two load levels.
+On the sheddable-heavy code-completion workload, the probabilistic admitter reduced critical-tier
+TTFT by 74% (mean) and 82% (P90), and E2E latency by 50% (mean and P90), pooled across load
+
+Simulate Before You Scale: High-Fidelity LLM Inference Planning Without GPUs
+21
+levels (82% at near-saturation; negligible at low load where contention is absent). The shed rate
+increased by 6.8 percentage points and throughput decreased by 14%; the shed requests would
+otherwise incur long latency under overload. On the critical-heavy interactive-chat workload,
+the policy produced no meaningful change (≈2% TTFT, 1% E2E), confirming no regression. The
+simulation and validation workloads differ by design. What matters is relative ranking: the policy
+that BLIS ranked above the default also improved critical-tier latency on real hardware.
+Outcome. The probabilistic admitter was proposed to the llm-d open-source project and merged
+into the router as a configurable plugin with the simulation-derived parameters as defaults.2
+6.2
+Flow Control: Soft-Reflective Ceiling
+The probabilistic admitter addresses overload by shedding sheddable requests entirely. A comple-
+mentary problem arises when the operator wants to preserve all requests but protect critical-band
+latency by throttling dispatch as saturation rises. The soft-reflective ceiling policy implements this.
+The policy assigns each priority band 𝑖∈{0, . . . , 𝑁−1} (band 0 being critical) a ceiling
+𝑐𝑖(𝑠) = 1 −𝑖· 𝑠
+𝑁−1,
+(6)
+where 𝑠is the cluster saturation signal defined in §6.1. Band 0 is never gated (𝑐0 = 1 for all 𝑠). When
+saturation exceeds a band’s ceiling, dispatch to that band is rate-limited to every ⌈𝑠/(1−𝑠)⌉-th
+scheduling tick. The policy was again evolved using the BLIS-backed workflow described in §6.1.
+In simulation, across three workload profiles at near-capacity load, the soft-reflective ceiling
+reduced critical-class TTFT by 34–94% (mean) and E2E latency by 32–68% (mean) relative to the
+default constant-ceiling baseline, with negligible effect below the throughput knee.
+Real-cluster validation. We validated the policy using the same methodology as §6.1: Qwen3-14B
+on H100 GPUs routed through llm-d, comparing no-policy baseline against the soft-reflective
+ceiling. The deployment uses 2×H100 (sustainable throughput ≈17 req/s per instance, defined as
+the knee of the latency-load curve), with 80% critical / 20% sheddable traffic. We evaluate three
+workload profiles spanning distinct output-length regimes: code generation (2K input / 128 output
+tokens, 4–24 rps), interactive chat (4K input / 1K output tokens, 5–40 rps), and reasoning (1K input /
+1.5K output tokens, 0.2–1.2 rps). We add a constant-ceiling control (ceiling fixed at 1.0) to isolate the
+algorithm’s marginal contribution from router overhead. The benefit is regime-dependent: near the
+throughput knee (≈1× sustainable load), the policy reduces E2E P50 by 32–48% relative to no-policy
+baseline; below saturation it is a no-op or adds slight gating delay (+5–6% E2E on chat, +31% on
+reasoning at 0.2 rps); under heavy overload (reasoning at 1.2 rps), it trades TTFT (+88%) for TPOT
+(−32%), increasing E2E by 30%. The marginal contribution beyond the router-only control is 11%
+TPOT and 6% E2E across the overloaded subset. Table 10 (Appendix J) reports per-workload results;
+hardware validation confirms the simulated gains transfer to real serving.
+Outcome. Like the probabilistic admitter, the soft-reflective ceiling policy was merged into the
+llm-d router as a configurable flow-control plugin.3
+7
+Discussion and Limitations
+The accuracy study (§4) characterizes where BLIS’s predictions degrade; this section addresses the
+simulator’s broader limitations to be addressed in future work. Most limitations below are matters
+2https://github.com/llm-d/llm-d-router/tree/main/pkg/epp/framework/plugins/requestcontrol/admitter/
+probabilisticadmitter
+3https://github.com/llm-d/llm-d-router/tree/main/pkg/epp/framework/plugins/flowcontrol/usagelimits/
+softreflectiveceiling
+
+22
+Guhathakurta et al.
+of coverage rather than of design: each unmodeled feature maps to a specific model term or module
+(§3), so adding it extends BLIS rather than restructuring it.
+Validation scale. The evidence in this paper spans two scales. The latency-model training (§3.3)
+and the accuracy validation (§4) are single-instance: each experiment fits or measures one vLLM
+instance of up to 8 GPUs under tensor parallelism. The configuration search (§5) and both policy
+case studies (§6) instead run multi-instance, on real llm-d deployments of up to 8 H100 GPUs across
+multiple replicas, with the probabilistic admitter validated on 4×H100 and the soft-reflective ceiling
+on 2×H100. The case-study validations measure relative policy improvement rather than absolute
+latency, which is the quantity a policy search requires (§6.1), and provide preliminary evidence
+that policies discovered in BLIS transfer to multi-instance serving. BLIS’s absolute prediction error
+at multi-node scale, where cross-node interconnect and placement effects come into play, remains
+to be measured, and we leave this to future work.
+Interconnect and parallelism. BLIS reduces communication to a bandwidth-based analytical
+term (§3) that omits three effects. Topology is invisible, so peers sharing an NVLink domain,
+a rack, or a cross-rack path are modeled identically. Contention is under-modeled, since each
+transfer is assumed to see full bandwidth; this is why the all-reduce term under-estimates NVLink
+contention at higher tensor-parallel degrees (§4.6) and would diverge further on shared cross-
+node links. Latency variability is absent, as a deterministic constant cannot reproduce jitter from
+queueing or congestion. A topology- and contention-aware term would close these, with larger
+gains across nodes. In terms of parallelism, the main gap is expert parallelism, where the all-reduce
+term does not capture all-to-all dispatch and would enter as a separate term (pipeline and hybrid
+parallelism [19, 35] are likewise unmodeled).
+Serving-technique coverage. BLIS models the subsystems most relevant to policy and config-
+uration (scheduling, batching, KV-cache management, admission control), but not multi-adapter
+(LoRA) serving, disaggregated prefill/decode [52] with cross-pool KV-cache transfer, or recent algo-
+rithmic optimizations. Speculative decoding [26] replaces the one-token-per-step assumption with
+a draft-and-verify loop; KV-cache compression shrinks the per-token cache, rescaling the decode
+memory-bandwidth term (𝑇dc
+kv , §3); LoRA maps to an adapter-aware batch-formation module; and
+disaggregation maps to separate prefill and decode pools linked by a transfer term.
+Model, hardware, and workload scope. Our evaluation covers dense and mixture-of-experts
+transformers on NVIDIA GPUs (H100, A100, L40S), drawn largely from a few popular model
+families (Llama, Qwen, Mistral), under ServeGen and Azure traces (§4.1). Within this family BLIS
+generalizes to unseen models and GPUs without re-fitting, since the basis functions read their
+inputs (FLOPs, memory traffic, layer and head counts) from the HuggingFace config.json and
+GPU datasheet (§3.3); a new architecture adds a basis term while existing coefficients stay valid
+(Appendix F). Generalization may weaken where those inputs no longer capture execution: state-
+space models [17] and RWKV [40] carry recurrent state in place of the KV cache, and multi-head
+latent attention [16] reshapes the per-token cache, neither of which the current decode term models.
+Non-NVIDIA accelerators (AMD GPUs, TPUs) are untested, and the NVIDIA-fit overhead terms
+would likely need re-fitting per vendor. Workloads with extreme characteristics absent from our
+traces (e.g., very long multi-turn conversations or bursty order-of-magnitude spikes) may also
+exhibit different error profiles.
+Platform drift. BLIS mirrors the scheduling semantics of a specific vLLM version (§4.1) and the
+distributed inference logic of llm-d, so its modeled physics are tied to those implementations and
+must be updated as they evolve. Modular policy interfaces (§3) let components update independently.
+
+Simulate Before You Scale: High-Fidelity LLM Inference Planning Without GPUs
+23
+Saturated regimes. BLIS’s latency model is calibrated for the region where the system is loaded
+but not deeply saturated; under heavy overload, small perturbations in arrival or service times
+produce disproportionate queueing effects that no deterministic simulator can predict precisely. The
+consequence is bounded: search and policy evolution seek operating points that avoid saturation,
+where BLIS reliably separates configurations that meet SLOs from those that do not.
+8
+Related Work
+Architectural and hardware simulators. Cycle-level simulators such as LPGSim [34] and ACAL-
+Sim [28] model GPU microarchitecture, and LLMCompass [51] extends this to accelerator design;
+BLIS instead abstracts per-GPU execution with a roofline model [45] and advances through discrete
+events [7] where the coupled dynamics of §2.2 arise. Learned predictors such as NeuSight [25]
+likewise generalize to unseen GPUs but forecast operator latency in isolation, whereas BLIS embeds
+its estimate in a coupled simulation of end-to-end behavior under contention.
+LLM-serving simulators and analytical predictors. The tools closest to BLIS predict per-
+deployment latency: discrete-event simulators (Vidur [1], LLMServingSim [13, 14]), the steady-state
+estimator AIConfigurator [48], and closed-form estimators (llm-optimizer [8], GenZ [6]); §2.3
+contrasts their scope with BLIS and §4 their accuracy. Others plan configuration by searching
+parallelism [29], composing per-kernel latencies [5], or measuring candidates [24]; a trace-driven
+simulator characterizes prefix-cache reuse [38].
+Serving and scheduling policies. Recent systems refine individual control axes: preemption
+granularity, phase-aware scheduling, and learned routing [11, 12, 27]; energy-aware frequency
+control, online/offline co-serving, and network-layer flow scheduling [41, 44, 50]; and cluster
+placement across heterogeneous GPUs cast as max-flow [32] or mixed-integer planning [10]. BLIS
+forms a substrate for evaluating policies through pluggable interfaces (§3.5) without kernel changes.
+9
+Conclusion
+We presented BLIS, a deterministic, CPU-only discrete-event simulator that predicts the latency
+and throughput of an LLM serving deployment without per-configuration profiling. BLIS pairs a
+physics-informed latency model, fit once, with a coupled simulation of the full serving pipeline.
+Across 36 experiments spanning six models, three GPU types, and four workloads, BLIS predicts
+end-to-end latency to a median 6.7% error and runs roughly 200× faster than real execution,
+generalizing across model families and GPUs without re-profiling. Driving a configuration search
+for Llama-2-70B on H100, BLIS identifies a 4-GPU deployment that holds a 300 ms mean TTFT
+SLO under sustained load, and real-cluster runs confirm the validity of this configuration. Beyond
+benchmarking, an admission policy evolved in simulation was merged into the open-source llm-d
+serving stack, where it reduced critical-tier TTFT P90 by up to 82% under overload. A complementary
+flow-control policy, evolved the same way and likewise merged into llm-d, throttles rather than
+sheds lower-priority traffic, reducing end-to-end P50 latency by 32–48% on overloaded workloads.
+More broadly, by predicting latency on a CPU in seconds and exposing admission, routing, and
+scheduling as replaceable interfaces under a deterministic fitness function, BLIS enables broad
+configuration search and policy evolution, reducing reliance on cluster-hours benchmarking and
+pointing toward serving policies designed by exploration rather than by hand.
+References
+[1] Amey Agrawal, Nitin Kedia, Jayashree Mohan, Ashish Panwar, Nipun Kwatra, Bhargav S. Gulavani, Ramachandran
+Ramjee, and Alexey Tumanov. 2024. VIDUR: A LARGE-SCALE SIMULATION FRAMEWORK FOR LLM INFERENCE.
+In Proceedings of Machine Learning and Systems, P. Gibbons, G. Pekhimenko, and C. De Sa (Eds.), Vol. 6. 351–366. https:
+//proceedings.mlsys.org/paper_files/paper/2024/file/b74a8de47d2b3c928360e0a011f48351-Paper-Conference.pdf
+
+24
+Guhathakurta et al.
+[2] Amey Agrawal, Nitin Kedia, Ashish Panwar, Jayashree Mohan, Nipun Kwatra, Bhargav S. Gulavani, Alexey Tumanov,
+and Ramachandran Ramjee. 2024. Taming throughput-latency tradeoff in LLM inference with sarathi-serve. In
+Proceedings of the 18th USENIX Conference on Operating Systems Design and Implementation (Santa Clara, CA, USA)
+(OSDI’24). USENIX Association, USA, Article 7, 18 pages.
+[3] AI-native Systems Research. 2025. Nous: A Framework That Runs the Scientific Method on Software Systems.
+https://github.com/AI-native-Systems-Research/agentic-strategy-evolution.
+[4] Takuya Akiba, Shotaro Sano, Toshihiko Yanase, Takeru Ohta, and Masanori Koyama. 2019. Optuna: A Next-generation
+Hyperparameter Optimization Framework. In Proceedings of the 25th ACM SIGKDD International Conference on
+Knowledge Discovery & Data Mining (Anchorage, AK, USA) (KDD ’19). Association for Computing Machinery, New
+York, NY, USA, 2623–2631. doi:10.1145/3292500.3330701
+[5] Alibaba. 2025. InferSim: A Lightweight LLM Inference Performance Simulator. https://github.com/alibaba/InferSim.
+[6] Abhimanyu Bambhaniya, Ritik Raj, Geonhwa Jeong, Souvik Kundu, Sudarshan Srinivasan, Suvinay Subramanian,
+Midhilesh Elavazhagan, Madhu Kumar, and Tushar Krishna. 2025. Demystifying AI Platform Design for Distributed
+Inference of Next-Generation LLM models. arXiv:2406.01698 [cs.AR] https://arxiv.org/abs/2406.01698
+[7] Jerry Banks, {John S.} Carson, {Barry L.} Nelson, and {David Malcolm} Nicol. 2010. Discrete-Event System Simulation (5
+ed.). Prentice-Hall.
+[8] BentoML. 2024. llm-optimizer: LLM Inference Optimization and Benchmarking Tool. https://github.com/bentoml/llm-
+optimizer.
+[9] James Bergstra, Rémi Bardenet, Yoshua Bengio, and Balázs Kégl. 2011. Algorithms for Hyper-Parameter Optimiza-
+tion. In Advances in Neural Information Processing Systems, J. Shawe-Taylor, R. Zemel, P. Bartlett, F. Pereira, and
+K. Weinberger (Eds.), Vol. 24. Curran Associates, Inc.
+https://proceedings.neurips.cc/paper_files/paper/2011/file/
+86e8f7ab32cfd12577bc2619bc635690-Paper.pdf
+[10] Jiaming Cheng and Duong Tung Nguyen. 2026. Scalable Joint Resource Allocation for SLO-Constrained LLM Inference
+in Heterogeneous GPU Clouds. arXiv:2604.07472 [cs.LG] https://arxiv.org/abs/2604.07472
+[11] Chia chi Hsieh, Zan Zong, Xinyang Chen, Jianjiang Li, Jidong Zhai, and Lijie Wen. 2026. FlowPrefill: Decoupling Preemp-
+tion from Prefill Scheduling Granularity to Mitigate Head-of-Line Blocking in LLM Serving. arXiv:2602.16603 [cs.DC]
+https://arxiv.org/abs/2602.16603
+[12] Eunyeong Cho, Jehyeon Bang, Ranggi Hwang, and Minsoo Rhu. 2026. PASCAL: A Phase-Aware Scheduling Algorithm
+for Serving Reasoning-based Large Language Models . In 2026 IEEE International Symposium on High Performance
+Computer Architecture (HPCA). IEEE Computer Society, Los Alamitos, CA, USA, 1–16. doi:10.1109/HPCA68181.2026.
+11408493
+[13] Jaehong Cho, Hyunmin Choi, Guseul Heo, and Jongse Park. 2026. LLMServingSim 2.0: A Unified Simulator for
+Heterogeneous and Disaggregated LLM Serving Infrastructure. In 2026 IEEE International Symposium on Performance
+Analysis of Systems and Software (ISPASS). 1–14. doi:10.1109/ISPASS69572.2026.00012
+[14] Jaehong Cho, Minsu Kim, Hyunmin Choi, Guseul Heo, and Jongse Park. 2024. LLMServingSim: A HW/SW Co-
+Simulation Infrastructure for LLM Inference Serving at Scale. In 2024 IEEE International Symposium on Workload
+Characterization (IISWC). 15–29. doi:10.1109/IISWC63097.2024.00012
+[15] Tri Dao, Daniel Y. Fu, Stefano Ermon, Atri Rudra, and Christopher Ré. 2022. FLASHATTENTION: fast and memory-
+efficient exact attention with IO-awareness. In Proceedings of the 36th International Conference on Neural Information
+Processing Systems (New Orleans, LA, USA) (NIPS ’22). Curran Associates Inc., Red Hook, NY, USA, Article 1189,
+16 pages.
+[16] DeepSeek-AI, Aixin Liu, Bei Feng, Bin Wang, Bingxuan Wang, Bo Liu, Chenggang Zhao, Chengqi Dengr, Chong Ruan,
+Damai Dai, Daya Guo, Dejian Yang, Deli Chen, Dongjie Ji, Erhang Li, Fangyun Lin, Fuli Luo, Guangbo Hao, Guanting
+Chen, Guowei Li, H. Zhang, Hanwei Xu, Hao Yang, Haowei Zhang, Honghui Ding, Huajian Xin, Huazuo Gao, Hui Li,
+Hui Qu, J. L. Cai, Jian Liang, Jianzhong Guo, Jiaqi Ni, Jiashi Li, Jin Chen, Jingyang Yuan, Junjie Qiu, Junxiao Song, Kai
+Dong, Kaige Gao, Kang Guan, Lean Wang, Lecong Zhang, Lei Xu, Leyi Xia, Liang Zhao, Liyue Zhang, Meng Li, Miaojun
+Wang, Mingchuan Zhang, Minghua Zhang, Minghui Tang, Mingming Li, Ning Tian, Panpan Huang, Peiyi Wang, Peng
+Zhang, Qihao Zhu, Qinyu Chen, Qiushi Du, R. J. Chen, R. L. Jin, Ruiqi Ge, Ruizhe Pan, Runxin Xu, Ruyi Chen, S. S.
+Li, Shanghao Lu, Shangyan Zhou, Shanhuang Chen, Shaoqing Wu, Shengfeng Ye, Shirong Ma, Shiyu Wang, Shuang
+Zhou, Shuiping Yu, Shunfeng Zhou, Size Zheng, T. Wang, Tian Pei, Tian Yuan, Tianyu Sun, W. L. Xiao, Wangding
+Zeng, Wei An, Wen Liu, Wenfeng Liang, Wenjun Gao, Wentao Zhang, X. Q. Li, Xiangyue Jin, Xianzu Wang, Xiao Bi,
+Xiaodong Liu, Xiaohan Wang, Xiaojin Shen, Xiaokang Chen, Xiaosha Chen, Xiaotao Nie, Xiaowen Sun, Xiaoxiang
+Wang, Xin Liu, Xin Xie, Xingkai Yu, Xinnan Song, Xinyi Zhou, Xinyu Yang, Xuan Lu, Xuecheng Su, Y. Wu, Y. K. Li,
+Y. X. Wei, Y. X. Zhu, Yanhong Xu, Yanping Huang, Yao Li, Yao Zhao, Yaofeng Sun, Yaohui Li, Yaohui Wang, Yi Zheng,
+Yichao Zhang, Yiliang Xiong, Yilong Zhao, Ying He, Ying Tang, Yishi Piao, Yixin Dong, Yixuan Tan, Yiyuan Liu, Yongji
+Wang, Yongqiang Guo, Yuchen Zhu, Yuduan Wang, Yuheng Zou, Yukun Zha, Yunxian Ma, Yuting Yan, Yuxiang You,
+Yuxuan Liu, Z. Z. Ren, Zehui Ren, Zhangli Sha, Zhe Fu, Zhen Huang, Zhen Zhang, Zhenda Xie, Zhewen Hao, Zhihong
+
+Simulate Before You Scale: High-Fidelity LLM Inference Planning Without GPUs
+25
+Shao, Zhiniu Wen, Zhipeng Xu, Zhongyu Zhang, Zhuoshu Li, Zihan Wang, Zihui Gu, Zilin Li, and Ziwei Xie. 2024.
+DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model. arXiv:2405.04434 [cs.CL]
+https://arxiv.org/abs/2405.04434
+[17] Albert Gu and Tri Dao. 2024.
+Mamba: Linear-Time Sequence Modeling with Selective State Spaces.
+arXiv:2312.00752 [cs.LG] https://arxiv.org/abs/2312.00752
+[18] Nikolaus Hansen, Sibylle D. Müller, and Petros Koumoutsakos. 2003. Reducing the Time Complexity of the Derandom-
+ized Evolution Strategy with Covariance Matrix Adaptation (CMA-ES). Evolutionary Computation 11, 1 (2003), 1–18.
+doi:10.1162/106365603321828970
+[19] Yanping Huang, Youlong Cheng, Ankur Bapna, Orhan Firat, Mia Xu Chen, Dehao Chen, HyoukJoong Lee, Jiquan
+Ngiam, Quoc V. Le, Yonghui Wu, and Zhifeng Chen. 2019. GPipe: efficient training of giant neural networks using
+pipeline parallelism. Curran Associates Inc., Red Hook, NY, USA.
+[20] J. Kiefer. 1953. Sequential Minimax Search for a Maximum. Proc. Amer. Math. Soc. 4, 3 (1953), 502–506.
+http:
+//www.jstor.org/stable/2032161
+[21] Vijay Korthikanti, Jared Casper, Sangkug Lym, Lawrence McAfee, Michael Andersch, Mohammad Shoeybi, and
+Bryan Catanzaro. 2022. Reducing Activation Recomputation in Large Transformer Models. arXiv:2205.05198 [cs.LG]
+https://arxiv.org/abs/2205.05198
+[22] Kubernetes SIGs. 2024. inference-perf: Production-Scale GenAI Inference Performance Benchmarking Tool. https:
+//github.com/kubernetes-sigs/inference-perf.
+[23] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin Zheng, Cody Hao Yu, Joseph Gonzalez, Hao Zhang,
+and Ion Stoica. 2023. Efficient Memory Management for Large Language Model Serving with PagedAttention. In
+Proceedings of the 29th Symposium on Operating Systems Principles (Koblenz, Germany) (SOSP ’23). Association for
+Computing Machinery, New York, NY, USA, 611–626. doi:10.1145/3600006.3613165
+[24] Malgorzata Lazuka, Andreea Anghel, and Thomas Parnell. 2024. LLM-Pilot: Characterize and Optimize Performance of
+your LLM Inference Services. In Proceedings of the International Conference for High Performance Computing, Networking,
+Storage, and Analysis (Atlanta, GA, USA) (SC ’24). IEEE Press, Article 16, 18 pages. doi:10.1109/SC41406.2024.00022
+[25] Seonho Lee, Amar Phanishayee, and Divya Mahajan. 2025. Forecasting GPU Performance for Deep Learning Training
+and Inference. In Proceedings of the 30th ACM International Conference on Architectural Support for Programming
+Languages and Operating Systems, Volume 1 (Rotterdam, Netherlands) (ASPLOS ’25). Association for Computing
+Machinery, New York, NY, USA, 493–508. doi:10.1145/3669940.3707265
+[26] Yaniv Leviathan, Matan Kalman, and Yossi Matias. 2023. Fast inference from transformers via speculative decoding. In
+Proceedings of the 40th International Conference on Machine Learning (Honolulu, Hawaii, USA) (ICML’23). JMLR.org,
+Article 795, 13 pages.
+[27] Gangmuk Lim, Wanyu Zhao, Brighten Godfrey, Jiaxin Shan, Le Xu, and Liguang Xie. 2026. Lodestar: An Online-
+Learning LLM Inference Router. arXiv:2606.00946 [cs.DC] https://arxiv.org/abs/2606.00946
+[28] Wei-Fen Lin, Jen-Chien Chang, Yen-Po Chen, Zi-Yi Tai, Yu-Chen Chang, Chia-Pao Chiang, Yu-Yang Lee, and Yu-Jie
+Wang. 2026. ACALSim: A Scalable Parallel Simulation Framework for High-Performance System Design Space
+Exploration. Proc. ACM Meas. Anal. Comput. Syst. 10, 2, Article 28 (May 2026), 24 pages. doi:10.1145/3805626
+[29] Yi-Chien Lin, Woosuk Kwon, Ronald Pineda, and Fanny Nina Paravecino. 2025. APEX: An Extensible and Dynamism-
+Aware Simulator for Automated Parallel Execution in LLM Serving. arXiv:2411.17651 [cs.DC] https://arxiv.org/abs/
+2411.17651
+[30] llm-d Community. 2024. llm-d-benchmark: End-to-End Benchmarking Harness for llm-d. https://github.com/llm-
+d/llm-d-benchmark.
+[31] llm-d Community. 2024. llm-d: Kubernetes-Native Distributed Inference Serving. https://github.com/llm-d/llm-d.
+[32] Yixuan Mei, Yonghao Zhuang, Xupeng Miao, Juncheng Yang, Zhihao Jia, and Rashmi Vinayak. 2025. Helix: Serv-
+ing Large Language Models over Heterogeneous GPUs and Network via Max-Flow. In Proceedings of the 30th
+ACM International Conference on Architectural Support for Programming Languages and Operating Systems, Vol-
+ume 1 (Rotterdam, Netherlands) (ASPLOS ’25). Association for Computing Machinery, New York, NY, USA, 586–602.
+doi:10.1145/3669940.3707215
+[33] Microsoft Azure. 2024. Azure Public Dataset: LLM Inference Trace. https://github.com/Azure/AzurePublicDataset.
+[34] Hyunwoo Nam, Jay Hwan Lee, Yeonsoo Kim, Mengzhao Zhang, Jeonggeun Kim, and Bernd Burgstaller. 2026. LPGSim:
+A Lightweight Parallel GPU Simulator Maximizing Speed with Trustworthy Simulation. Proc. ACM Meas. Anal. Comput.
+Syst. 10, 2, Article 44 (May 2026), 27 pages. doi:10.1145/3805642
+[35] Deepak Narayanan, Aaron Harlap, Amar Phanishayee, Vivek Seshadri, Nikhil R. Devanur, Gregory R. Ganger, Phillip B.
+Gibbons, and Matei Zaharia. 2019. PipeDream: generalized pipeline parallelism for DNN training. In Proceedings of
+the 27th ACM Symposium on Operating Systems Principles (Huntsville, Ontario, Canada) (SOSP ’19). Association for
+Computing Machinery, New York, NY, USA, 1–15. doi:10.1145/3341301.3359646
+
+26
+Guhathakurta et al.
+[36] Neural Magic. 2024. GuideLLM: Scalable Inference Benchmarking for Large Language Models. https://github.com/vllm-
+project/guidellm.
+[37] NVIDIA Corporation. 2024. NVIDIA H100 Tensor Core GPU Datasheet. https://www.nvidia.com/en-us/data-center/
+h100/.
+[38] Bei Ouyang, Yifan Qiao, and Jiarong Xing. 2026. UniCache: Unifying Prefix Cache Eviction for Heterogeneous LLM
+Serving Workloads. Proc. ACM Meas. Anal. Comput. Syst. 10, 2, Article 54 (May 2026), 27 pages. doi:10.1145/3805652
+[39] Pratyush Patel, Esha Choukse, Chaojie Zhang, Aashaka Shah, Íñigo Goiri, Saeed Maleki, and Ricardo Bianchini. 2025.
+Splitwise: Efficient Generative LLM Inference Using Phase Splitting. In Proceedings of the 51st Annual International
+Symposium on Computer Architecture (Buenos Aires, Argentina) (ISCA ’24). IEEE Press, 118–132. doi:10.1109/ISCA59077.
+2024.00019
+[40] Bo Peng, Eric Alcaide, Quentin Anthony, Alon Albalak, Samuel Arcadinho, Stella Biderman, Huanqi Cao, Xin Cheng,
+Michael Chung, Matteo Grella, Kranthi Kiran GV, Xuzheng He, Haowen Hou, Jiaju Lin, Przemyslaw Kazienko, Jan
+Kocon, Jiaming Kong, Bartlomiej Koptyra, Hayden Lau, Krishna Sri Ipsit Mantri, Ferdinand Mom, Atsushi Saito,
+Guangyu Song, Xiangru Tang, Bolun Wang, Johan S. Wind, Stanislaw Wozniak, Ruichong Zhang, Zhenyuan Zhang,
+Qihang Zhao, Peng Zhou, Qinghua Zhou, Jian Zhu, and Rui-Jie Zhu. 2023. RWKV: Reinventing RNNs for the
+Transformer Era. arXiv:2305.13048 [cs.CL] https://arxiv.org/abs/2305.13048
+[41] Yifan Qiao, Shu Anzai, Shan Yu, Haoran Ma, Shuo Yang, Yang Wang, Miryung Kim, Yongji Wu, Yang Zhou, Jiarong
+Xing, Joseph E. Gonzalez, Ion Stoica, and Harry Xu. 2025. ConServe: Fine-Grained GPU Harvesting for LLM Online
+and Offline Co-Serving. arXiv:2410.01228 [cs.DC] https://arxiv.org/abs/2410.01228
+[42] Vijay Janapa Reddi, Christine Cheng, David Kanter, Peter Mattson, Guenther Schmuelling, Carole-Jean Wu, Brian
+Anderson, Maximilien Breughe, Mark Charlebois, William Chou, Ramesh Chukka, Cody Coleman, Sam Davis, Pan
+Deng, Greg Diamos, Jared Duke, Dave Fick, J. Scott Gardner, Itay Hubara, Sachin Idgunji, Thomas B. Jablin, Jeff
+Jiao, Tom St. John, Pankaj Kanwar, David Lee, Jeffery Liao, Anton Lokhmotov, Francisco Massa, Peng Meng, Paulius
+Micikevicius, Colin Osborne, Gennady Pekhimenko, Arun Tejusve Raghunath Rajan, Dilip Sequeira, Ashish Sirasao,
+Fei Sun, Hanlin Tang, Michael Thomson, Frank Wei, Ephrem Wu, Lingjie Xu, Koichi Yamada, Bing Yu, George Yuan,
+Aaron Zhong, Peizhao Zhang, and Yuchen Zhou. 2020. MLPerf Inference Benchmark. arXiv:1911.02549 [cs.LG]
+https://arxiv.org/abs/1911.02549
+[43] Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, and Tri Dao. 2024. FlashAttention-3: fast
+and accurate attention with asynchrony and low-precision. In Proceedings of the 38th International Conference on
+Neural Information Processing Systems (Vancouver, BC, Canada) (NIPS ’24). Curran Associates Inc., Red Hook, NY, USA,
+Article 2193, 28 pages.
+[44] Yijun Sun, Xudong Liao, Songrun Xie, Hao Chen, Han Tian, Wenxue Li, Yiming Zhang, and Kai Chen. 2026. Stage-Aware
+Communication Scheduling for Disaggregated LLM Serving. arXiv:2603.17456 [cs.NI] https://arxiv.org/abs/2603.17456
+[45] Samuel Williams, Andrew Waterman, and David Patterson. 2009. Roofline: an insightful visual performance model for
+multicore architectures. Commun. ACM 52, 4 (April 2009), 65–76. doi:10.1145/1498765.1498785
+[46] William Won, Taekyung Heo, Saeed Rashidi, Srinivas Sridharan, Sudarshan Srinivasan, and Tushar Krishna. 2023.
+ASTRA-sim2.0: Modeling Hierarchical Networks and Disaggregated Systems for Large-model Training at Scale.
+In 2023 IEEE International Symposium on Performance Analysis of Systems and Software (ISPASS). IEEE, 283–294.
+doi:10.1109/ispass57527.2023.00035
+[47] Yuxing Xiang, Xue Li, Kun Qian, Yan Zhang, Wenyuan Yu, Ennan Zhai, Xin Jin, and Jingren Zhou. 2026. ServeGen:
+Workload Characterization and Generation of Large Language Model Serving in Production. In 23rd USENIX Symposium
+on Networked Systems Design and Implementation (NSDI 26). USENIX Association, Renton, WA, 1845–1859. https:
+//www.usenix.org/conference/nsdi26/presentation/xiang-servegen
+[48] Tianhao Xu, Yiming Liu, Xianglong Lu, Yijia Zhao, Xuting Zhou, Aichen Feng, Yiyi Chen, Yi Shen, Qin Zhou, Xumeng
+Chen, Ilya Sherstyuk, Haorui Li, Rishi Thakkar, Ben Hamm, Yuanzhe Li, Xue Huang, Wenpeng Wu, Anish Shanbhag,
+Harry Kim, Chuan Chen, and Junjie Lai. 2026. AIConfigurator: Lightning-Fast Configuration Optimization for
+Multi-Framework LLM Serving. arXiv:2601.06288 [cs.LG] https://arxiv.org/abs/2601.06288
+[49] Gyeong-In Yu, Joo Seong Jeong, Geon-Woo Kim, Soojeong Kim, and Byung-Gon Chun. 2022. Orca: A Distributed
+Serving System for Transformer-Based Generative Models. In 16th USENIX Symposium on Operating Systems Design
+and Implementation (OSDI 22). USENIX Association, Carlsbad, CA, 521–538. https://www.usenix.org/conference/
+osdi22/presentation/yu
+[50] Jiahuan Yu, Aryan Taneja, Junfeng Lin, and Minjia Zhang. 2026. VoltanaLLM: Energy-Efficient and SLO-Aware
+Disaggregated LLM Serving via Adaptive Frequency Control Íand State-Space Routing. In ISC High Performance 2026
+Research Paper Proceedings (41st International Conference). 1–19. doi:10.23919/ISC.2026.11520495
+[51] Hengrui Zhang, August Ning, Rohan Baskar Prabhakar, and David Wentzlaff. 2025. LLMCompass: Enabling Efficient
+Hardware Design for Large Language Model Inference. In Proceedings of the 51st Annual International Symposium on
+Computer Architecture (Buenos Aires, Argentina) (ISCA ’24). IEEE Press, 1080–1096. doi:10.1109/ISCA59077.2024.00082
+
+Simulate Before You Scale: High-Fidelity LLM Inference Planning Without GPUs
+27
+[52] Yinmin Zhong, Shengyu Liu, Junda Chen, Jianbo Hu, Yibo Zhu, Xuanzhe Liu, Xin Jin, and Hao Zhang. 2024. DistServe:
+disaggregating prefill and decoding for goodput-optimized large language model serving. In Proceedings of the 18th
+USENIX Conference on Operating Systems Design and Implementation (Santa Clara, CA, USA) (OSDI’24). USENIX
+Association, USA, Article 11, 18 pages.
+A
+Accuracy Across Config Sweep
+This appendix expands the configuration-sweep summary of §4.2. Figure 8 reports E2E MAPE
+under controlled single-parameter sweeps on H100 with a general-purpose workload. The top
+panel uses Llama-3.1-8B (dense) and the bottom panel uses Mixtral-8x7B (MoE). Each group varies
+one serving parameter (TP degree, chunk size, GPU memory utilization, or KV-cache offloading)
+while holding all others at baseline.
+BLIS tracks the ground truth closely at baseline configurations; on the dense model, error increases
+with tensor-parallel degree (2.5% at TP=1 to 15.5% at TP=2) because BLIS estimates all-reduce
+latency from NVLink bandwidth and message size rather than measured communication traces,
+and this estimate under-accounts for contention when concurrent batches compete for interconnect
+bandwidth. At smaller chunk sizes, more frequent prefill/decode interleaving amplifies scheduling-
+order sensitivity. LLM-Optimizer and AIConfigurator do not accept chunk size, offloading, or
+memory utilization as inputs, so their predictions remain constant across those sweeps: they predict
+the same latency regardless of how the server is configured, which is correct only at the default
+setting. For the MoE panel, LLM-Optimizer treats expert routing as dense, overestimating compute
+and yielding high MAPE. BLIS and AIConfigurator model expert routing explicitly and maintain
+lower error.
+B
+Simulation Runtime
+Table 3 reports per-tool median simulation runtime and speedup over real-hardware execution,
+supplementing the accuracy-speed tradeoff of §4.3.
+Table 3. Median simulation runtime and speedup over real-hardware execution across all experiments.
+Speedup is the median of per-experiment ratios to real execution; LLMServingSim is evaluated on a 1,000-
+request subset (§4.1), so its runtime and speedup are not directly comparable to the full-trace tools.
+Simulator
+Median Runtime (s)
+Speedup vs. Real
+BLIS
+5.7
+212×
+Vidur
+8.6
+141×
+LLM-Optimizer
+0.1
+22,809×
+AIConfigurator
+2.1
+586×
+LLMServingSim
+604.2
+0.1×
+C
+Concurrency Derivation for LLM-Optimizer and AIConfigurator
+LLM-Optimizer and AIConfigurator predict per-request latency as a function of concurrency (number
+of in-flight requests) rather than arrival rate. Production workloads are naturally specified in terms
+of user-facing quantities like request rate, not system internals like concurrency; operators set
+SLOs on throughput and latency at a given traffic level, not on a fixed number of in-flight requests.
+Since our evaluation uses rate-driven workloads to reflect this reality, we derive the appropriate
+concurrency input for each tool using throughput-matching, a self-consistent procedure that
+requires no ground-truth latency measurements.
+
+28
+Guhathakurta et al.
+Fig. 8. Per-tool E2E MAPE under single-parameter configuration sweeps on H100 (mbt=2048, gpu_mem=0.9,
+offloading off). Top: Llama-3.1-8B (dense). Bottom: Mixtral-8x7B (MoE).
+Procedure. For each experiment, we sweep a geometric series of concurrency levels 𝑐∈{1, 2, 4,
+8, . . . , 1024} (capped at the vLLM max_num_seqs limit). At each level, the tool returns a predicted
+throughput ˆ𝑇(𝑐) in requests per second. We select the concurrency 𝑐∗whose predicted throughput
+best matches the workload’s known arrival rate 𝜆:
+𝑐∗= arg min
+𝑐
+
+ˆ𝑇(𝑐) −𝜆
+𝜆
+
+(7)
+The latency predictions (TTFT, ITL, E2E) at𝑐∗are then taken as the tool’s output for that experiment.
+AIConfigurator specifics. AIConfigurator’s SDK returns a Pareto DataFrame spanning multiple
+concurrency levels in a single call. We filter to rows matching the experiment’s tensor-parallel
+degree and apply the same throughput-matching procedure on the seq/s column. E2E latency is
+derived from the matched row as E2E = TTFT + (time per output token) × (𝑁out −1), where 𝑁out
+is the output sequence length.
+Matching fidelity. Because both tools produce throughput predictions at discrete concurrency
+levels, the selected operating point ˆ𝑇(𝑐∗) does not in general equal 𝜆exactly. We quantify this
+discretization residual | ˆ𝑇(𝑐∗) −𝜆|/𝜆at the summary level (duration-weighted average across stages)
+for all experiments in our evaluation. LLM-Optimizer’s power-of-two concurrency grid yields a
+mean residual of 8.7%; AIConfigurator’s Pareto grid yields a mean residual of 12.3%. In both cases,
+the matching residual is substantially smaller than the tools’ intrinsic prediction error on latency
+metrics (§4.2), confirming that the discretization introduced by throughput-matching is not the
+
+Simulate Before You Scale: High-Fidelity LLM Inference Planning Without GPUs
+29
+dominant source of inaccuracy in these baselines. The only workload quantity used as input is the
+arrival rate 𝜆, which is a design parameter of the load profile (set before the run), not a measurement;
+no ground-truth latency or throughput measurements enter the concurrency derivation.
+D
+Why Re-Profiling Vidur Is Insufficient
+A natural question is whether Vidur’s high TTFT error (§4.2) could be resolved by collecting fresh
+profiling data. Re-profiling addresses the wrong problem: Vidur’s simulator models a system whose
+scheduling semantics, state representation, and execution abstraction are structurally incompatible
+with modern vLLM. Fresh timing data fed into the existing simulator still produces predictions for
+the wrong system. Table 4 enumerates the gaps; we highlight the three most consequential below.
+Monolithic prefill. Vidur models prefill as all-or-nothing (entire prompt in one pass) with a binary
+prefill/decode flag. vLLM v1 chunks prefill dynamically via a shared token budget with concurrent
+decode requests, requiring partial-progress state that Vidur’s request representation cannot express.
+Immutable batches. Vidur’s batches are fixed once formed; vLLM v1 rebuilds the batch at ev-
+ery iteration with mid-execution preemption. The preemption cascades and batch-composition
+dynamics that determine tail latency under load have no analog in Vidur’s event model.
+Incompatible profiling infrastructure. Vidur’s profiling imports from sarathi (a pre-chunked-
+prefill fork) and produces data in a schema (monolithic prefill latency, fixed-batch decode latency)
+incompatible with the heterogeneous mixed-batch forward passes vLLM v1 executes. Replacing
+the profiling target does not help: the predictor expects per-phase latencies for batch sizes that no
+longer correspond to how vLLM forms batches.
+Resolving these gaps would require rewriting the scheduler event model, request state machine,
+batch formation logic, and profiling infrastructure, which constitutes building a new simulator
+rather than re-profiling the existing one.
+Table 4. Architectural comparison between Vidur’s simulator model and production vLLM v1. Each row
+represents a structural incompatibility that cannot be resolved by collecting new profiling data.
+Feature
+Vidur
+vLLM v1
+Prefill execution
+Monolithic (all-or-nothing)
+Dynamic chunked (token budget)
+Scheduling granularity
+Batch-level (immutable)
+Iteration-level (rebuilt each step)
+Prefix caching
+Not modeled
+Content-addressed block hashing
+Phase model
+Binary prefill/decode flag
+Unified token-progress counter
+Speculative decoding
+Not modeled
+Integrated with scheduling
+Profiling backend
+sarathi (diverged fork)
+N/A (vLLM-native)
+Attention workload
+Homogeneous (batch_size=1)
+Heterogeneous mixed batches
+E
+Roofline MFU Factors
+The roofline configuration used in the ablation study (§4.4) scales the analytical basis functions by
+fixed per-phase, per-GPU Model-FLOPs-Utilization (MFU) factors. Table 5 lists these values; they
+are derived from published utilization benchmarks [21, 42, 43] and set as constants in the hardware
+configuration. Prefill factors exceed decode factors on every GPU because small-batch decode runs
+at an arithmetic intensity well below the roofline ridge.
+
+30
+Guhathakurta et al.
+Table 5. Fixed MFU factors used by the roofline configuration.
+GPU
+Prefill
+Decode
+H100
+0.45
+0.30
+A100-SXM
+0.38
+0.18
+L40S
+0.32
+0.08
+F
+Latency-Model Coefficients
+Section 3.3 describes the two-loop fitting procedure, the loss (Equation 3), the training set, the
+inner-loop optimizers, and why the fit transfers to unseen configurations. Table 6 complements
+that description with the role and unit of every fitted coefficient. The four scaling factors (𝛽1𝑎–𝛽2𝑏)
+absorb the gap between peak and observed throughput per phase, and the additive terms (𝛽5–𝛽8,
+𝛼0–𝛼2) carry the fixed overheads the roofline omits.
+Table 6. Latency-model coefficients. Dimensionless scaling factors relate observed to analytical throughput;
+overhead terms are in microseconds.
+Coefficient
+Role
+Unit
+𝛼: per-request CPU/framework overheads
+𝛼0
+Request ingestion overhead
+𝜇s
+𝛼1
+Detokenization overhead
+𝜇s
+𝛼2
+Token streaming overhead
+𝜇s/tok
+𝛽: per-step GPU execution scaling and overheads
+𝛽1𝑎
+Prefill compute scaling
+dimensionless
+𝛽1𝑏
+Prefill memory scaling
+dimensionless
+𝛽2𝑎
+Decode compute scaling
+dimensionless
+𝛽2𝑏
+Decode memory scaling
+dimensionless
+𝛽3
+Weight loading scaling
+dimensionless
+𝛽4
+TP communication scaling
+dimensionless
+𝛽5
+Per-layer overhead
+𝜇s/layer
+𝛽6
+Per-request overhead
+𝜇s/req
+𝛽7
+Per-step constant
+𝜇s/step
+𝛽8
+Per-MoE-layer overhead
+𝜇s/layer
+G
+Evaluation Coverage
+Table 7 enumerates every configuration validated in the accuracy study (§4.1). The design combines
+breadth across models, workloads, and hardware with depth along the configuration knobs: for the
+two representative models used in the knob sweep (Llama-3.1-8B and Mixtral-8x7B on H100), we
+vary tensor-parallel degree, chunk size, GPU-memory utilization, and CPU offloading one knob at
+a time from the baseline, while the remaining models and both non-H100 GPUs are validated at
+the baseline configuration. All deployments use FP16 precision.
+H
+Request Lifecycle
+Figure 9 traces a single request through the two simulation layers of §3.4, from arrival to completion.
+The left bands mark the two scopes: the cluster-level data plane (admission and routing) and the per-
+instance engine (wait queue, batch formation, step execution). Two engine-local control loops sit on
+
+Simulate Before You Scale: High-Fidelity LLM Inference Planning Without GPUs
+31
+Table 7. Configurations validated in the accuracy study (§4.1), grouped by GPU. Chunk is
+max_num_batched_tokens; Mem. is gpu_memory_utilization; Offload is KV-cache CPU offloading. All
+deployments use FP16 precision.
+Model
+Workload
+TP
+Chunk
+Mem.
+Offload
+H100-80GB SXM
+Llama-3.1-8B
+General-Purpose
+1
+1024
+0.90
+off
+Llama-3.1-8B
+General-Purpose
+1
+2048
+0.90
+off
+Llama-3.1-8B
+General-Purpose
+1
+2048
+0.90
+on
+Llama-3.1-8B
+General-Purpose
+1
+2048
+0.95
+off
+Llama-3.1-8B
+General-Purpose
+1
+8192
+0.90
+off
+Llama-3.1-8B
+General-Purpose
+2
+2048
+0.90
+off
+Llama-3.1-8B
+Code Generation
+1
+2048
+0.90
+off
+Llama-3.1-8B
+Roleplay
+1
+2048
+0.90
+off
+Llama-3.1-8B
+Reasoning
+1
+2048
+0.90
+off
+Qwen3-14B
+General-Purpose
+1
+2048
+0.90
+off
+Qwen3-14B
+Code Generation
+1
+2048
+0.90
+off
+Qwen3-14B
+Roleplay
+1
+2048
+0.90
+off
+CodeLlama-34B
+General-Purpose
+2
+2048
+0.90
+off
+CodeLlama-34B
+Code Generation
+2
+2048
+0.90
+on
+CodeLlama-34B
+Roleplay
+2
+2048
+0.90
+on
+Llama-2-70B
+General-Purpose
+4
+2048
+0.90
+off
+Llama-2-70B
+Code Generation
+4
+2048
+0.90
+on
+Llama-2-70B
+Roleplay
+4
+2048
+0.90
+on
+Mixtral-8x7B
+General-Purpose
+2
+1024
+0.90
+off
+Mixtral-8x7B
+General-Purpose
+2
+2048
+0.90
+off
+Mixtral-8x7B
+General-Purpose
+2
+2048
+0.90
+on
+Mixtral-8x7B
+General-Purpose
+2
+2048
+0.95
+off
+Mixtral-8x7B
+General-Purpose
+2
+8192
+0.90
+off
+Mixtral-8x7B
+General-Purpose
+4
+2048
+0.90
+off
+Mixtral-8x7B
+Code Generation
+2
+2048
+0.90
+on
+Mixtral-8x7B
+Roleplay
+2
+2048
+0.90
+on
+Mixtral-8x22B
+General-Purpose
+8
+2048
+0.90
+off
+Mixtral-8x22B
+Code Generation
+8
+2048
+0.90
+off
+Mixtral-8x22B
+Roleplay
+8
+2048
+0.90
+off
+Mixtral-8x22B
+Reasoning
+8
+2048
+0.90
+off
+A100-80GB SXM
+Llama-3.1-8B
+General-Purpose
+1
+2048
+0.90
+off
+Qwen3-14B
+General-Purpose
+1
+2048
+0.90
+off
+CodeLlama-34B
+General-Purpose
+2
+2048
+0.90
+off
+Llama-2-70B
+General-Purpose
+4
+2048
+0.90
+off
+L40S (48 GB, PCIe)
+Llama-3.1-8B
+General-Purpose
+1
+2048
+0.90
+off
+Qwen3-14B
+General-Purpose
+1
+2048
+0.90
+off
+the spine: batch formation preempts and later recomputes evicted requests under KV-cache pressure,
+and step execution re-schedules whenever the wait queue is non-empty (the work-conserving
+invariant). The vermillion back-edge is the snapshot feedback path of §2.2: admission and routing
+read instance state only through refreshed snapshots, so their decisions act on stale load.
+
+32
+Guhathakurta et al.
+Arrival
+Admission
+Routing
+Wait queue
+Batch formation
+Step execution
+Completion
+route to selected instance
+response returned
+DATA PLANE
+ENGINE INSTANCE
+preempt: evict,
+recompute
+next step if queue
+non-empty
+instance state
+Snapshot feedback (§2.2): admission and routing
+read instance state (queue depth, KV utilization,
+batch size, in-flight count) only through periodically
+refreshed snapshots, so their decisions lag the true
+load.
+Fig. 9. Request lifecycle through the two simulation layers. The back-edge marks the snapshot feedback loop:
+routing and admission act on periodically refreshed instance state, so their decisions can lag the true load.
+I
+Configuration Search Details
+This appendix reports the full search space explored by each tool in §5 and the specific configurations
+deployed for validation on H100 GPUs.
+Search space. Table 8 lists the parameter ranges each tool searched. BLIS explores the widest space
+(420 configurations across topology, batching, scheduling, routing, admission, and preemption); the
+other tools search subsets determined by their modelling scope.
+Deployed configurations. Table 9 reports the vLLM serving parameters deployed on the H100
+cluster for each validated configuration in Table 2. All deployments share a common baseline:
+vLLM v0.22.1, BF16 precision, gpu_memory_utilization=0.9, paged KV-cache (block size 16),
+chunked prefill enabled, and max_model_len=4096. For multi-replica deployments, llm-d routes
+requests via its Endpoint Picker Plugin (EPP). Vidur, AIConfigurator, and LLM-Optimizer do not
+expose routing configuration, so their deployments use the llm-d default EPP profile: weighted
+scoring over queue-depth (weight 2), KV-cache utilization (weight 2), and prefix-cache hit rate
+
+Simulate Before You Scale: High-Fidelity LLM Inference Planning Without GPUs
+33
+Table 8. Search space per tool. BLIS searches jointly over all listed dimensions via NSGA-II; Vidur sweeps TP
+and batch size with a fixed vLLM scheduler; AIConfigurator and LLM-Optimizer each produce a fixed grid
+from their internal logic.
+Tool
+Parameter
+Values
+Configs
+BLIS
+TP × replicas
+{2, 4, 8} × {1, 2, 4} (≤8 GPUs)
+420
+max_num_seqs
+{32, 64, 128, 256, 512}
+max_num_batched_tokens
+{2048, 4096, 8192}
+Chunked prefill
+{on, off}
+Scheduling
+{FCFS, SJF}
+Routing
+{round-robin, least-loaded, weighted}
+Admission / preemption
+{tier-shed, always-admit} / {FCFS, prior-
+ity}
+Vidur
+TP × replicas
+{4, 8} × {1, 2} (≤8 GPUs)
+35
+batch_size_cap
+{32, 64, 128, 256, 512}
+Scheduler
+{vllm, sarathi} (chunk ∈{512, 1024, 2048})
+AICfg
+TP × replicas
+{2, 4, 8} × {1, . . . , 4} (≤8 GPUs)
+13
+max_num_seqs
+Tool-determined (20 or 80 or 144)
+LLMOpt
+TP
+{2, 3, 4, 5, 6, 7, 8}
+7
+max_num_seqs
+Tool-determined (4, 8, or 16)
+(weight 3). BLIS searches over routing strategies (§5) but its top-2 Pareto configurations are single-
+replica, so routing does not apply. No admission control or flow control was applied (all requests
+admitted immediately).
+Table 9. Deployed vLLM serving parameters for each validated configuration. All use Llama-2-70B on H100
+SXM 80 GB, PP=1, BF16, chunked prefill enabled. “default” denotes the vLLM default of 8192 tokens when
+chunked prefill is on. Single-replica deployments bypass routing.
+Tool
+TP
+Replicas
+GPUs
+max_num_seqs
+max_num_batched_tokens
+Routing
+BLIS
+4
+1
+4
+64
+8192
+n/a (1 replica)
+BLIS
+4
+1
+4
+256
+8192
+n/a (1 replica)
+Vidur
+4
+2
+8
+64
+default
+EPP weighted
+Vidur
+4
+2
+8
+256
+default
+EPP weighted
+AICfg
+2
+2
+4
+20
+566
+EPP weighted
+AICfg
+2
+3
+6
+20
+566
+EPP weighted
+LLMOpt
+2
+1
+2
+4
+default
+n/a (1 replica)
+LLMOpt
+4
+1
+4
+8
+default
+n/a (1 replica)
+J
+Soft-Reflective Ceiling: Per-Workload Results
+Table 10 reports the full per-workload P50 latency deltas for the soft-reflective ceiling policy (§6.2).
+All measurements are on Qwen3-14B served on 2×H100 GPUs (TP=1), 80% critical / 20% sheddable
+traffic. Sustainable throughput is estimated at ≈17 req/s per instance, defined as the arrival rate at
+which mean E2E latency begins to inflect upward (the knee of the latency-load curve).
+
+34
+Guhathakurta et al.
+Table 10. Soft-reflective ceiling policy: P50 latency change relative to baseline (no policy) by workload profile
+and arrival rate.
+Workload
+rps
+TTFT Δ
+TPOT Δ
+E2E Δ
+code_gen
+4
++1%
+−1%
+−1%
+code_gen
+10
++5%
+−1%
++2%
+code_gen
+16
+−35%
+−24%
+−32%
+code_gen
+24
+−23%
+−13%
+−22%
+chat
+5
++2%
+<1%
++5%
+chat
+10
++3%
+<1%
++6%
+chat
+25
+−28%
+−29%
+−24%
+chat
+40
+−11%
+−19%
++2%
+reasoning
+0.2
++19%
++16%
++31%
+reasoning
+0.7
+−85%
+−23%
+−48%
+reasoning
+1.2
++88%
+−32%
++30%

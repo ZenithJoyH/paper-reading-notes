@@ -1,0 +1,1103 @@
+Compositional Performance Modeling of LLM
+Inference Clusters with Hierarchical KV Caching
+Ruiyang Ma∗, Sheng Qi∗, DaiKang Kuang∗, Teng Ma†, Guojie Luo∗
+∗Peking University
+†Independent Researcher
+ruiyang@stu.pku.edu.cn
+shengqi2018@pku.edu.cn
+kuangdaikang@stu.pku.edu.cn
+stmatengss@gmail.com
+gluo@pku.edu.cn
+Abstract—Design-space exploration of LLM inference clusters
+requires predicting how hardware and serving policies interact
+with hierarchical key–value (KV) caching. Isolated operation
+proﬁles alone do not determine cluster latency: reuse changes com-
+putational demand, while KV location, capacity, and contention
+govern execution order. We present a compositional discrete-
+event simulator based on separating local service costs from
+shared resource and KV availability. Compute and transfer models
+calibrated on one-preﬁll/one-decode (1P–1D) deployments are
+reused across compatible workers, enabling policy and topology
+comparisons without per-conﬁguration latency ﬁtting. Validation
+against SGLang covers Qwen3-8B and Qwen3-32B on 1P–1D
+and 3P–1D clusters. Mean request end-to-end latency error is
+1.34% for question answering and 6.36% for captured coding
+sessions, measured as mean absolute percentage error. CPU
+simulation reduces replay turnaround by 15.33× on average;
+real replay includes prescribed arrival gaps. Measured session-
+afﬁnity and simulated retention studies demonstrate how the
+framework guides policy selection by predicting the joint effects
+on computation, latency, and KV occupancy.
+Index Terms—LLM inference, performance modeling, hierar-
+chical KV cache, discrete-event simulation
+I. INTRODUCTION
+Designing an LLM inference cluster requires choosing hard-
+ware resources and serving policies together. Preﬁll–decode
+disaggregation provisions the two phases independently, while
+hierarchical key–value (KV) caching and locality-aware routing
+reduce repeated computation [1], [2]. Evaluating these choices
+on physical deployments is costly, motivating simulation for
+early design-space exploration.
+Existing inference simulators predict operation costs from
+hardware proﬁles and compose them with serving models [3],
+[4]. With hierarchical caching, however, operation costs alone
+leave a crucial question unresolved: when can a request use
+the KV it needs? Routing and retention change both computa-
+tional demand and data availability. Evaluating their interaction
+requires composing service costs with cache state and resource
+dependencies.
+The challenge is that a cached preﬁx is not necessarily ready
+for computation. Routing determines which worker can access
+it, and eviction determines whether it remains available [2], [5].
+A host-memory copy requires device capacity and retrieval be-
+fore use. Concurrent requests further alter queues and batches.
+The simulator must therefore track reusable content, physical
+capacity, and execution readiness together.
+Our insight is to separate local service costs from the
+shared state that determines execution eligibility. We present
+Request router
+Request stream
+Prefill worker
+GPU  ·  KV in device 
+memory
+Host  ·  local KV tier
+Decode worker
+GPU  ·  KV in device 
+memory
+Host  ·  local KV tier
+KV handoff
+Store  ·  persistent or shared KV
+Read / write / publish
+Fig. 1. KV hierarchy: device memory serves computation; host and optional
+storage tiers extend reuse through retrieval.
+a compositional simulator that distinguishes logical KV con-
+tent, reserved capacity, and replicas ready for computation.
+An event-driven orchestrator couples calibrated compute and
+transfer models through this state and resource queues. Models
+calibrated on a logical one-preﬁll/one-decode (1P–1D) deploy-
+ment can then be reused across compatible workers, enabling
+policy and topology changes without per-conﬁguration end-to-
+end latency ﬁtting.
+Validation against SGLang [5] covers Qwen3-8B and
+Qwen3-32B [6] in 1P–1D and 3P–1D deployments. Mean
+absolute percentage error (MAPE) in request end-to-end (E2E)
+latency averages 1.34% for question answering (QA) and
+6.36% for captured coding sessions, with replay cases weighted
+equally. CPU simulation reduces replay turnaround by 15.33×
+on average; real replay includes prescribed arrival gaps.
+Session-afﬁnity and time-to-live (TTL) studies demonstrate
+policy evaluation using the same service models.
+The paper makes three contributions:
+• We formulate KV-aware service composition through ex-
+plicit residency, capacity reservations, and completion
+events.
+• We develop analytical compute and transfer models that
+reuse local calibration across compatible cluster workers.
+• We demonstrate accurate latency and reuse prediction
+across two topologies, with lower E2E and ﬁrst-token
+errors than an adapted LLMServingSim on the evaluated
+workloads.
+arXiv:2610.15366v1  [cs.PF]  11 Oct 2026
+
+II. BACKGROUND AND RELATED WORK
+A. Inference with Hierarchical KV Caching
+LLM inference comprises preﬁll, which processes uncached
+input tokens and produces KV state, and decode, which extends
+each sequence token by token. Disaggregation assigns these
+phases to separate workers, each using one or more accel-
+erators. It allows independent provisioning but requires KV
+handoff and sufﬁcient destination capacity [1]. Within a worker,
+continuous batching updates the active request set between
+iterations [7], while chunked preﬁll divides prompt processing
+into smaller steps [8]. Paged allocation and preﬁx caching
+further shape execution by managing physical KV capacity and
+reusing content across requests [5], [9].
+Hierarchical caching extends reuse beyond device memory
+by retaining KV in host memory or storage, at the cost of
+retrieval [10], [11]. Figure 1 illustrates this organization. Device
+memory (L1) supplies computation directly; local host memory
+(L2) retains preﬁxes beyond device capacity; and optional
+shared or persistent storage (L3) extends retention or access
+across workers [2]. We distinguish tiers by accessibility, so
+shared DRAM may serve as L3. This distinction separates the
+existence of a reusable preﬁx from the cost and feasibility of
+accessing it.
+B. Related Inference Cluster Simulators
+Execution-cost modeling. Vidur uses operator proﬁles [3],
+with preﬁx caching and routing policies in its canary imple-
+mentation [12]. LLMServingSim combines layerwise proﬁling
+with serving and interconnect simulation [4], including P–D
+handoff and device/CPU/CXL caching [13]. These approaches
+represent hardware and execution in detail. Our whole-iteration
+and effective-path calibration instead aligns service estimates
+with the target engine’s execution boundaries; explicit KV
+dependencies compose them into cluster behavior.
+Stateful workload modeling. Frontier uses role-speciﬁc
+abstractions for disaggregated execution and stateful re-
+quests [14]. AgentServeSim models agent-program orchestra-
+tion, including completion-driven successor release and reten-
+tion across tool gaps [15]. Such dependencies address how
+workload demand evolves. Our open-loop coding replays hold
+recorded ordering and scaled interarrival intervals ﬁxed, al-
+lowing cluster policies to be evaluated under identical offered
+demand.
+Table I positions our focus on KV-constrained service com-
+position. A reusable preﬁx affects latency through its location,
+destination capacity, and retrieval time. Representing these
+dependencies separately from policy selection and service pre-
+diction enables calibration reuse when cluster conﬁgurations
+change. Section V tests this capability across topologies and
+against an adapted LLMServingSim.
+III. SIMULATOR ARCHITECTURE
+A. Overview
+To predict how serving policies affect cluster latency, the
+architecture separates decisions, service costs, and execution el-
+igibility (Fig. 2). Conﬁguration and policy interfaces deﬁne the
+TABLE I
+SELECTED MODELING EMPHASES OF RELATED SIMULATORS.
+Framework
+Modeling emphasis
+State or workload focus
+Vidur [3], [12]
+Proﬁled operator costs
+Serving; preﬁx caching
+in canary
+LLMServingSim [4],
+[13]
+Hardware–serving
+interaction
+PD execution; tiered
+preﬁx caching
+Frontier [14]
+Role-speciﬁc execution
+Stateful serving requests
+AgentServeSim [15]
+Program orchestration
+Successor release and
+tool-gap retention
+This work
+KV-constrained service
+composition
+Residency, reservations,
+and visibility
+workload and its placement; hierarchical KV state determines
+data availability; local models supply operation durations. The
+orchestrator combines these inputs into completion events and
+traces of latency, queues, and reuse.
+A host-preﬁx hit illustrates these dependencies: a request
+reserves device capacity and retrieves the preﬁx, computes
+its uncached sufﬁx, and transfers KV to the decode worker.
+Contention at each stage determines the latency beneﬁt of reuse.
+B. User Conﬁguration and Policy Injection
+A cluster conﬁguration deﬁnes the available workers, their
+execution settings, connectivity, and per-tier capacities. Work-
+loads retain token identities for preﬁx matching, output lengths
+for generation, and session identiﬁers for afﬁnity routing. Ar-
+rivals are independent of simulated completions, so alternative
+policies receive the same open-loop demand.
+Gateway policies select workers, while KV policies select
+reuse and retention actions, including eviction, writeback, and
+prefetching. These decisions are proposals subject to the or-
+chestrator’s capacity and dependency checks. Separating policy
+selection from physical allocation preserves a common model
+of feasible execution across policy changes.
+C. Hierarchical KV Representation
+Logical KV content may have several physical replicas with
+different access costs. We represent each replica by its location,
+sharing scope, tier, allocation, and access path. Preﬁx matching
+identiﬁes the reusable content, while replica state determines
+where it can be accessed and whether it can be reclaimed. P–D
+handoff creates availability at another worker through a transfer
+rather than an instantaneous change of ownership.
+The representation also distinguishes allocated space from
+usable data. An in-progress copy reserves destination capacity
+but becomes available to computation only on completion. Each
+physical allocation is counted once even when several requests
+reference it. These rules prevent shared preﬁxes from being
+charged repeatedly and concurrent transfers from claiming the
+same free space.
+D. Performance-Model Components
+Service models predict the duration of an eligible operation
+from its workload and execution context. Preﬁll depends on
+executed tokens and existing context; decode depends on active
+sequences, context lengths, and CUDA-graph conﬁguration;
+transfer depends on payload and access path. Section IV
+
+Performance-model components
+Full trace
+Timestamps
+Prompts · 
+outputs
+Request 
+injection
+Timed release
+Gateway
+Routing policy
+Orchestrator
+Event clock · admission
+Dependencies · completion
+Prefill worker
+Batch · chunk · context
+Decode worker
+Graph bucket · context
+Cluster configuration
+Worker counts and roles
+Worker hardware & execution
+Per-tier memory capacities
+Network topology
+KV 
+scheduling
+policy
+Lookup
+Admission policy
+Eviction
+Writeback
+Prefetch
+KV hierarchy
+L1 · Device memory
+L2 · Local host
+L3 · Storage (optional)
+Residency · refs · reservations
+P–D and hierarchical transfer models
+Payload · direction · path · resource occupancy
+1P–1D profiles
+Calibrated compute and transfer costs
+Fig. 2. Policies select work, service models predict duration, and shared KV state governs execution eligibility.
+deﬁnes the corresponding predictors. The orchestrator accounts
+separately for admission and resource waiting.
+Backends combine service estimates with resource queues
+and sharing rules to schedule completions. Proﬁle changes
+affect service costs; backend changes may also affect con-
+tention. Both retain the orchestrator’s completion interface,
+allowing proﬁle reuse across compatible execution layouts and
+calibration domains.
+E. Discrete-Event Orchestration
+The orchestrator advances between arrivals, operation com-
+pletions, and maintenance events. Each event updates state and
+releases any newly available resources before eligible work is
+dispatched. Queueing and overlap consequently emerge from
+dependencies and resource occupancy rather than a separately
+ﬁtted queueing-delay model.
+KV movement obeys three invariants: destination capacity
+is reserved before dispatch, source replicas remain protected
+while in use, and destination replicas become visible only on
+completion. Requests that cannot satisfy admission conditions
+remain pending; reservations are released if an operation can-
+not proceed. These invariants impose consistent capacity and
+availability constraints across policies and access paths.
+IV. DATA-DRIVEN MODELING
+A. Calibration and Composition
+The modeling workﬂow turns local measurements into
+reusable compute and transfer predictors (Fig. 3). Calibration
+on a logical 1P–1D deployment ﬁxes the model, hardware, and
+KV layout while varying operation sizes and batches. Proﬁles
+record timing boundaries, ﬁtted parameters, and measured
+domains to support reuse across compatible workers.
+We ﬁrst compose the proﬁles in 1P–1D replay, where request
+timing depends on their interaction with queueing and KV state.
+Larger nP–mD conﬁgurations instantiate additional worker
+queues and capacities while retaining compatible proﬁles and
+modeling shared transfer resources. Changing cluster size there-
+fore changes resource occupancy and event ordering without
+requiring an end-to-end latency ﬁt.
+Component tests assess service-time prediction, while clus-
+ter tests evaluate how those costs compose under admission,
+queueing, and multi-source contention. We use frozen proﬁles
+1P–1D data collection and component modeling
+Stage 1
+Prefill
+Stage 2
+Decode
+Stage 3
+P–D handoff
+Stage 4
+GPU ↔ Host
+Optional extensions
+Stage 5*
+Persistent L3
+Stage 6*
+Shared Store
+Stage 7*
+Speculative decode
+Stage 8 · 1P–1D validation
+Frozen profiles · paired replay
+nP–mD cluster simulation
+Independent scale-out validation
+Fig. 3.
+Local compute and transfer proﬁles are assessed individually and
+composed for cluster-level validation.
+in both 1P–1D and 3P–1D replay, distinguishing interpolation
+within measured domains from extrapolation to other request
+shapes.
+B. Compute Modeling
+Preﬁll. Preﬁx reuse reduces executed work but leaves cached
+tokens in the attention context. For request i, let qi be the
+tokens executed in the current step, ci the preceding device-
+resident context, and ni the original input length. Context ci
+includes reused preﬁxes and completed chunks; a lower-tier
+match contributes only after retrieval. For batch size b, we
+predict
+btP = fP
+ b, {(qi, ci, ni)}b
+i=1; θP
+
+.
+(1)
+The coefﬁcients θP are ﬁtted by regularized regression on
+features of executed tokens, attention work, and batch shape.
+Batch features include the maximum and dispersion of original
+input lengths, which remain ﬁxed across steps. Distinguishing
+qi from ci accounts for the attention cost of a reused preﬁx
+without charging for its recomputation [5]. Calibration varies
+sufﬁx lengths, preﬁx lengths, and batch composition to capture
+these effects.
+Decode. A standard decode iteration produces one token
+per active sequence. CUDA graphs reduce launch overhead by
+replaying captured operations [16], but the smallest conﬁgured
+bucket accommodating batch size b also determines padding.
+We represent the resulting discrete changes using a GPU-time
+model for each bucket g:
+btGPU
+D
+= ag + dg
+b
+X
+i=1
+ℓi,
+(2)
+
+where ℓi is the context length of sequence i. The intercept
+ag captures ﬁxed bucket costs; dg scales aggregate context
+length to approximate KV-dependent attention. Tests with ho-
+mogeneous and mixed context lengths assess this aggregate
+approximation. A separate deployment correction maps GPU
+time to decode cadence; it is calibrated from previously col-
+lected light-load client time per output token (TPOT) and
+ﬁxed before replay. Proﬁles correspond to the conﬁgured graph
+capture, hardware, and execution settings; the orchestrator adds
+queueing and KV retrieval to these compute costs.
+C. Transfer Modeling
+Transfer cost depends on the operation, direction, endpoints,
+and physical payload. The KV page allocation and worker
+execution layout determine how token counts map to bytes.
+For operation and path k, we use
+btk(B) = αk + hk(B),
+(3)
+where B is payload size, αk is startup cost, and hk is a linear
+or piecewise-interpolated function. Each direction and path
+is calibrated separately. The backend combines this isolated
+service estimate with sharing rules to determine completion
+time; the orchestrator then makes the transferred KV available.
+P–D handoff. Calibration measures the interval from preﬁll
+completion to handoff completion on the preﬁll host. Because
+the interval includes software coordination, its ﬁtted rate rep-
+resents effective service rather than NIC bandwidth. In the
+evaluated conﬁguration, each source processes one active chunk
+at a time in FIFO order. When N chunks transfer concurrently
+to a decode worker, each receives 1/N of its isolated size-
+dependent rate. Multi-source cluster replay tests this sharing
+assumption beyond the pairwise calibration.
+Cross-tier movement. Separate host-to-device (H2D) and
+device-to-host (D2H) models capture preﬁx retrieval and write-
+back. The same interface can represent lower storage tiers
+through metadata queries and payload reads or writes: lookup
+cost depends on the metadata operation, while payload cost
+depends on bytes and access path. The evaluated proﬁles cover
+GPU–host movement. Recorded payload ranges distinguish
+interpolation from extrapolation.
+V. EVALUATION
+We test calibration reuse through component and cluster
+accuracy, compare against LLMServingSim, and quantify cache
+ﬁdelity and evaluation time.
+A. Experimental Setup
+We evaluate SGLang [5] serving Qwen3-8B and Qwen3-
+32B [6] on RDMA-connected NVIDIA L20Z hosts. Comparing
+1P–1D and 3P–1D varies preﬁll capacity with one decode
+worker. Each worker uses two GPUs with tensor parallelism
+(TP2) and 262144 device KV tokens; each P additionally
+provides 524352 host-memory tokens through HiCache [11].
+Both topologies use round-robin routing, BF16 KV, 64-token
+pages, 4096-token preﬁll chunks, and a limit of 32 running
+requests per worker. D-side preﬁx and host caching, as well as
+L3, are disabled.
+The workloads cover document reuse and session reuse
+(Table II). QASPER [17] and SQuAD [18] requests share
+preﬁxes within a paper or paragraph and generate 128 tokens.
+Hashed sampling retains complete document groups to preserve
+reuse opportunities. Coding traces [19] (labeled Agentic in
+results) retain complete sessions whose lengths fall within the
+source dataset’s interquartile range.
+TABLE II
+WORKLOADS AND MEAN REQUEST LENGTHS. GROUPS ARE PAPERS,
+PARAGRAPHS, AND SESSIONS, RESPECTIVELY.
+Trace
+Groups Reqs.
+Mean tokens
+Arrivals
+Input Output
+QASPER
+129
+506
+5449.8
+128.0 Uniform
+SQuAD
+71
+400
+226.0
+128.0 Uniform
+Coding
+50
+451 13325.4
+650.4 Trace-scaled
+A replay case speciﬁes a model, topology, dataset, and
+offered request rate. For each topology and QA dataset, rates
+are 1 and 2 requests/s for 8B, and 0.5 and 1 for 32B. Coding
+replays preserve request contents and output lengths while
+scaling recorded interarrival intervals to 0.25 and 0.5 requests/s
+for 8B, and 0.125 and 0.25 for 32B; 3P–1D additionally uses 1
+and 0.5, respectively. The resulting 16 QA and ten coding cases
+each replay a complete dataset from empty caches. Table entries
+average per-case metrics equally within each row; QA rows
+combine both datasets. Cases share source requests rather than
+independent samples. QA datasets were prepared after model
+proﬁles and the simulator were frozen, whereas coding traces
+informed mechanism development.
+B. Component Accuracy
+Compute errors remain below 5% and transfer errors below
+10% for both models (Table III). Tests vary preﬁll sufﬁx and
+context lengths, decode batch and context sizes, and transfer
+payloads. Training and test requests differ, although some
+writeback sizes recur; the 32B preﬁll result uses previously
+inspected development data.
+TABLE III
+COMPONENT SERVICE-TIME MAPE (%): COMPUTE ERRORS BELOW 5%,
+TRANSFER ERRORS BELOW 10%.
+Component
+8B
+32B
+Preﬁll GPU
+4.62
+2.18
+Decode GPU
+3.14
+2.13
+P–D effective completion
+3.79
+9.58
+Host →GPU
+6.97
+4.15
+GPU →Host
+0.19
+0.17
+Cluster replays retain the preﬁll and transfer ﬁts, with de-
+code recalibrated for the enlarged KV pool. They test how
+these service estimates compose under admission, queueing,
+and overlapping transfers, including extrapolation to SQuAD
+prompts shorter than the compute calibration inputs.
+C. Cluster Accuracy
+Mean E2E MAPE is 1.34% for QA and 6.36% for coding
+sessions, measuring latency from client request start to last
+token. Figure 4 includes every paired request in both topologies,
+supporting reuse of local proﬁles as preﬁll capacity increases.
+
+Coding sessions exercise bursty arrivals, variable generation
+lengths, and changing queues and batches.
+0.75
+1.00
+0.75
+1.00
+Predicted E2E (s)
+QA, 8B
+2
+3
+4
+2
+3
+4
+QA, 32B
+0
+25
+50
+Measured E2E (s)
+0
+25
+50
+Predicted E2E (s)
+Agentic, 8B
+0
+60
+120
+Measured E2E (s)
+0
+60
+120
+Agentic, 32B
+1P–1D
+3P–1D
+Identity
+Fig. 4. E2E predictions across both topologies: mean MAPE is 1.34% for QA
+and 6.36% for coding sessions. Replay cases are equally weighted.
+We assess responsiveness and streaming separately in Ta-
+ble IV. Time to ﬁrst token (TTFT) spans client request start
+to ﬁrst token; TPOT averages subsequent inter-token intervals.
+TTFT error uses mean absolute error (MAE), and TPOT
+error uses MAPE. QA errors remain similar across topologies;
+coding sessions have larger ﬁrst-token errors alongside longer
+generations.
+Predictions also reproduce the main accumulation and drain-
+ing patterns in complete 3P–1D coding replays (Fig. 5). Aligned
+5-s windows show outstanding requests, including waiting and
+execution, alongside completed requests and delivered tokens.
+These complementary views connect request latency to client-
+visible backlog and throughput.
+0
+15
+30
+In-flight
+requests
+8B, 0.5 req/s
+0
+15
+30
+32B, 0.25 req/s
+0.0
+1.5
+3.0
+Completions
+(req/s)
+0.0
+1.5
+3.0
+0
+300
+600
+900
+Elapsed time (s)
+0
+800
+1600
+Output
+(token/s)
+0
+600
+1200
+1800
+Elapsed time (s)
+0
+800
+1600
+Measured
+Predicted
+Fig. 5. Predicted and measured backlog and throughput follow similar temporal
+patterns in 5-s windows of 3P–1D coding replay (8B: 0.5 requests/s; 32B: 0.25).
+D. Comparison with LLMServingSim
+We compare against LLMServingSim [4], [13] on the same
+workloads with identical tokens, arrivals, routes, and KV ca-
+pacities. The baseline uses measured L20Z kernel proﬁles, cal-
+ibrated collective and host-transfer rates, and nominal RDMA
+bandwidth. We correct veriﬁed host-capacity accounting and
+cache-hit handling issues. Its native P–D path aborts on all ten
+coding cases; to complete these replays, we add reservation of
+decode capacity for the prompt and generation budget before
+preﬁll. The compute, batching, and caching models remain
+unchanged. This adapted baseline tests the transfer of a vLLM-
+based execution model to our SGLang deployments.
+Our E2E and TTFT errors are consistently lower (Table IV).
+Coding E2E MAPE averages 6.36%, versus 15.21% for the
+baseline, and coding TPOT errors are lower in every case. QA
+TPOT favors LLMServingSim for 8B and our simulator for
+32B.
+TABLE IV
+MEAN ERRORS BY P:D TOPOLOGY (OURS / ADAPTED LLMSERVINGSIM):
+LOWER E2E AND TTFT ERRORS IN EVERY GROUP.
+Group
+E2E MAPE (%) TTFT MAE (ms) TPOT MAPE (%)
+QA 8B 1:1
+1.55 / 5.25
+15.4 / 33.6
+1.20 / 0.47
+QA 8B 3:1
+1.58 / 5.14
+15.1 / 32.9
+1.12 / 0.41
+QA 32B 1:1
+1.06 / 3.39
+23.4 / 62.5
+0.38 / 0.80
+QA 32B 3:1
+1.16 / 3.30
+24.7 / 61.1
+0.34 / 0.74
+Agentic 8B 1:1
+5.83 / 15.25
+86.1 / 236.6
+5.53 / 7.70
+Agentic 8B 3:1
+9.07 / 16.90
+155.1 / 681.1
+2.98 / 5.64
+Agentic 32B 1:1
+5.04 / 12.72
+207.0 / 565.1
+1.70 / 4.01
+Agentic 32B 3:1
+4.88 / 15.16
+215.1 / 2118.9
+1.69 / 4.37
+Our calibration captures whole iterations and effective trans-
+fer paths at the target engine’s execution boundaries. LLM-
+ServingSim composes kernel and layer costs with its serving
+model. KV availability and resource queues translate these costs
+into request timing. The comparison evaluates these complete
+simulator conﬁgurations, including engine and admission dif-
+ferences, rather than isolating individual mechanisms.
+E. Preﬁx Cache Accuracy
+Mean token-hit-ratio error remains within 1.23 percentage
+points (pp) in every group in Table V. Token hit ratio measures
+reused tokens as a fraction of total input; exact match measures
+requests with identical predicted and measured preﬁx lengths.
+Together they assess aggregate reuse and request-level ﬁdelity.
+TABLE V
+PREFIX PREDICTION CAPTURES REUSE ACROSS P:D TOPOLOGIES; CASE
+MEANS ARE EQUALLY WEIGHTED (PP: PERCENTAGE POINTS).
+Data
+Model P:D
+Token hit (%)
+Exact Hit error
+Measured Predicted match (%)
+(pp)
+QA
+8B
+1:1
+63.78
+63.93
+99.80
+0.15
+QA
+8B
+3:1
+40.44
+40.44
+100.00
+0.00
+QA
+32B
+1:1
+63.78
+63.93
+99.80
+0.15
+QA
+32B
+3:1
+40.44
+40.44
+100.00
+0.00
+Agentic 8B
+1:1
+80.61
+81.44
+90.58
+0.84
+Agentic 8B
+3:1
+58.64
+58.96
+97.49
+0.32
+Agentic 32B
+1:1
+79.39
+80.61
+81.49
+1.23
+Agentic 32B
+3:1
+57.98
+58.56
+94.97
+0.58
+The simulator captures the lower reuse when round-robin
+routing distributes related requests across three P workers.
+Coding aggregate agreement is closer than request-level agree-
+ment, as the exact-match column shows. All eight QASPER
+cases exercise host retrieval, with mean token-volume error of
+0.87% and matching host attribution for 99.68% of requests.
+
+Coding cases exercise writeback without retrieval, providing
+complementary coverage of host-cache behavior.
+F. Simulation Speed
+CPU simulation reduces replay turnaround by 15.33× on
+average across the evaluated conﬁgurations. Table VI com-
+pares client replay duration with CPU time for simulation and
+comparison on an Intel Xeon host using Python 3.11. Replay
+includes prescribed arrival gaps; startup and calibration are
+excluded. Rows average per-case ratios.
+TABLE VI
+REPLAY/CPU TURNAROUND: RATIOS ARE AVERAGED PER CASE; REPLAY
+INCLUDES ARRIVAL GAPS.
+Data
+Model Runs Replay (s) CPU (s) Mean ratio (×)
+QA
+8B
+8
+339.6
+55.5
+10.59
+QA
+32B
+8
+679.8
+53.6
+23.47
+Agentic 8B
+5
+1180.6
+143.1
+8.36
+Agentic 32B
+5
+2370.8
+141.9
+16.85
+CPU times remain similar across models despite longer 32B
+replays because simulation processes events without executing
+neural-network operations. This turnaround gain supports re-
+peated policy comparisons with ﬁxed proﬁles; it is not a GPU
+computation speedup.
+VI. APPLICATIONS
+The calibrated framework supports policy selection by pre-
+dicting how reuse changes work, latency, and occupancy. We
+evaluate session afﬁnity on real deployments and TTL retention
+in simulation, keeping workloads, hardware, and service models
+ﬁxed.
+A. Session-Afﬁnity Routing
+Session afﬁnity preserves each session’s initial worker as-
+signment to promote local preﬁx reuse [20]. We assign sessions
+cyclically and compare afﬁnity with round-robin routing on the
+3P–1D coding traces at 0.5 requests/s for 8B and 0.25 for 32B.
+Predictions are frozen before measurement, and each policy is
+measured once from empty caches.
+The simulator captures the policy’s main effect: lower preﬁll
+work with little change in E2E latency. Predicted uncached-
+input reductions are 50.3% and 47.7% for 8B and 32B, com-
+pared with measured reductions of 48.2% and 46.1%. Mean
+E2E changes are −0.23% and +1.21% in simulation, versus
++0.44% and +1.32% in measurement. The small 8B changes
+have opposite signs. The overall pattern is consistent with
+unchanged generation demand at the shared decode worker,
+showing why reuse and latency should be evaluated jointly.
+Figure 6 exposes variation across all 50 sessions, weight-
+ing sessions equally; aggregate latency means instead weight
+requests equally.
+B. KV Retention on Agent-Derived Traces
+TTL retention allows idle KV occupancy to be traded against
+later reuse. We augment least-recently-used (LRU) eviction
+with idle TTLs of 1, 10, 60, and 300 s for P-side L1/L2 on
+the same coding traces. Periodic checks reclaim expired entries
+100
+200
+300
+Uncached input / RR (%)
+0
+50
+100
+CDF (%)
+8B
+100
+200
+300
+Uncached input / RR (%)
+32B
+100
+120
+Mean E2E / RR (%)
+0
+50
+100
+CDF (%)
+100
+120
+Mean E2E / RR (%)
+Measured
+Predicted
+RR = 100%
+Fig. 6.
+Cumulative distributions over 50 sessions show lower aggregate
+uncached input with little E2E change under afﬁnity. Ratios use round-robin
+(RR) = 100%; 3P–1D rates are 0.5 requests/s (8B) and 0.25 (32B).
+only when active references and transfers permit it. Capacity-
+driven eviction remains LRU, and nonexpiring controls repro-
+duce the original predictions exactly.
+A 60-s TTL reduces time-weighted KV occupancy by 86.9%
+and 92.9% for 8B and 32B, with mean TTFT increases of 7.4%
+and 3.8% relative to LRU (Fig. 7). All policies use a common
+request-injection window. Expiration releases idle slots but can
+remove preﬁxes before reuse, linking the trade-off to inter-
+request gaps and resource-release timing. Occupancy measures
+used KV slots; allocated GPU memory remains unchanged. The
+sweep lets designers compare retention settings against their
+tolerance for ﬁrst-token delay.
+0
+40
+80
+KV residency (% of LRU)
+100
+104
+108
+112
+Mean TTFT (% of LRU)
+LRU
+300s
+60s
+1s, 10s
+8B · 0.5 req/s
+0
+40
+80
+KV residency (% of LRU)
+100
+104
+108
+112
+LRU
+300s
+60s
+1s, 10s
+32B · 0.25 req/s
+Fig. 7.
+Simulated idle TTLs reduce KV occupancy with a TTFT cost; both
+axes are normalized to LRU.
+Both studies reuse the same calibrated proﬁles, demon-
+strating policy substitution within a consistent model of KV
+availability, capacity, and contention.
+VII. CONCLUSION
+We presented a compositional simulator for evaluating LLM
+inference clusters with hierarchical KV caching. Explicit KV
+availability and resource queues enable local compute and
+transfer proﬁles to predict behavior across compatible workers.
+Across the evaluated deployments, E2E MAPE averages 1.34%
+for QA and 6.36% for coding; real replay takes 15.33× the
+CPU evaluation time on average. The framework supports
+early design-space exploration by quantifying how routing and
+retention policies jointly affect computational demand, request
+latency, and KV occupancy.
+
+REFERENCES
+[1] Y. Zhong, S. Liu, J. Chen, J. Hu, Y. Zhu, X. Liu, X. Jin, and
+H. Zhang, “DistServe: Disaggregating preﬁll and decoding for goodput-
+optimized large language model serving,” in 18th USENIX Symposium
+on Operating Systems Design and Implementation, 2024. [Online].
+Available: https://arxiv.org/abs/2401.09670
+[2] R. Qin, Z. Li, W. He, J. Cui, F. Ren, M. Zhang, Y. Wu, W. Zheng,
+and X. Xu, “Mooncake: Trading more storage for less computation—a
+KVCache-centric architecture for serving LLM chatbot,” in 23rd
+USENIX Conference on File and Storage Technologies, 2025, pp.
+155–170. [Online]. Available: https://www.usenix.org/conference/fast25/
+presentation/qin
+[3] A.
+Agrawal,
+N.
+Kedia,
+J.
+Mohan,
+A.
+Panwar,
+N.
+Kwatra,
+B.
+S.
+Gulavani,
+R.
+Ramjee,
+and
+A.
+Tumanov,
+“Vidur:
+A
+large-scale
+simulation
+framework
+for
+LLM
+inference,”
+in
+Proceedings
+of
+Machine
+Learning
+and
+Systems,
+vol.
+6,
+2024.
+[Online]. Available: https://proceedings.mlsys.org/paper_ﬁles/paper/2024/
+hash/b74a8de47d2b3c928360e0a011f48351-Abstract-Conference.html
+[4] J. Cho, H. Choi, G. Heo, and J. Park, “LLMServingSim 2.0: A uniﬁed
+simulator for heterogeneous and disaggregated LLM serving infrastruc-
+ture,” in IEEE International Symposium on Performance Analysis of
+Systems and Software, 2026, pp. 1–14.
+[5] L. Zheng, L. Yin, Z. Xie, C. Sun, J. Huang, C. H. Yu, S. Cao,
+C. Kozyrakis, I. Stoica, J. E. Gonzalez, C. Barrett, and Y. Sheng,
+“SGLang: Efﬁcient execution of structured language model programs,” in
+Advances in Neural Information Processing Systems, vol. 37, 2024. [On-
+line].
+Available:
+https://proceedings.neurips.cc/paper_ﬁles/paper/2024/
+hash/724be4472168f31ba1c9ac630f15dec8-Abstract-Conference.html
+[6] A. Yang, A. Li, B. Yang, B. Zhang, B. Hui, B. Zheng et al., “Qwen3
+technical report,” arXiv preprint arXiv:2505.09388, 2025. [Online].
+Available: https://arxiv.org/abs/2505.09388
+[7] G.-I.
+Yu,
+J.
+S.
+Jeong,
+G.-W.
+Kim,
+S.
+Kim,
+and
+B.-G.
+Chun,
+“Orca: A distributed serving system for transformer-based generative
+models,” in 16th USENIX Symposium on Operating Systems Design
+and Implementation, 2022, pp. 521–538. [Online]. Available: https:
+//www.usenix.org/conference/osdi22/presentation/yu
+[8] A.
+Agrawal,
+N.
+Kedia,
+A.
+Panwar,
+J.
+Mohan,
+N.
+Kwatra,
+B. Gulavani, A. Tumanov, and R. Ramjee, “Taming throughput-
+latency
+tradeoff
+in
+LLM
+inference
+with
+Sarathi-Serve,”
+in
+18th
+USENIX
+Symposium
+on
+Operating
+Systems
+Design
+and
+Implementation,
+2024,
+pp.
+117–134.
+[Online].
+Available:
+https://www.usenix.org/conference/osdi24/presentation/agrawal
+[9] W. Kwon, Z. Li, S. Zhuang, Y. Sheng, L. Zheng, C. H. Yu, J. E.
+Gonzalez, H. Zhang, and I. Stoica, “Efﬁcient memory management for
+large language model serving with PagedAttention,” in Proceedings of
+the ACM SIGOPS 29th Symposium on Operating Systems Principles,
+2023. [Online]. Available: https://arxiv.org/abs/2309.06180
+[10] Y.
+Sheng,
+L.
+Zheng,
+B.
+Yuan,
+Z.
+Li,
+M.
+Ryabinin,
+B.
+Chen,
+P. Liang, C. Re, I. Stoica, and C. Zhang, “FlexGen: High-throughput
+generative inference of large language models with a single GPU,” in
+Proceedings of the 40th International Conference on Machine Learning,
+vol. 202.
+PMLR, 2023, pp. 31 094–31 116. [Online]. Available:
+https://proceedings.mlr.press/v202/sheng23a.html
+[11] SGLang Project, “HiCache system design and optimization,” Ofﬁcial
+documentation, accessed September 20, 2026. [Online]. Available:
+https://docs.sglang.io/docs/advanced_features/hicache_design
+[12] Microsoft, “Vidur: Ofﬁcial implementation,” GitHub repository, accessed
+September 20, 2026; README documents canary preﬁx caching.
+[Online]. Available: https://github.com/microsoft/vidur
+[13] CASYS, KAIST, “LLMServingSim: Ofﬁcial documentation,” Ofﬁcial
+documentation, accessed September 20, 2026. [Online]. Available:
+https://llmservingsim.ai/docs/getting-started/overview
+[14] Y. Feng, X. Tan, Y. Deng, Y. Jiang, Y. Zhu, and H. Xu, “Frontier:
+Towards
+comprehensive
+and
+accurate
+LLM
+inference
+simulation,”
+arXiv preprint arXiv:2605.21312, 2026, version 2. [Online]. Available:
+https://arxiv.org/abs/2605.21312v2
+[15] R. H. Rajib, M. Zheng, and Q. Lou, “AgentServeSim: Serving-
+system simulation and policy search for LLM agent programs,”
+arXiv preprint arXiv:2606.09613, 2026, version 3. [Online]. Available:
+https://arxiv.org/abs/2606.09613v3
+[16] NVIDIA,
+“CUDA
+programming
+guide:
+CUDA
+graphs,”
+Of-
+ﬁcial
+documentation,
+accessed
+September
+20,
+2026.
+[On-
+line]. Available: https://docs.nvidia.com/cuda/cuda-programming-guide/
+04-special-topics/cuda-graphs.html
+[17] P. Dasigi, K. Lo, I. Beltagy, A. Cohan, N. A. Smith, and M. Gardner,
+“A dataset of information-seeking questions and answers anchored in
+research papers,” in Proceedings of NAACL-HLT, 2021, pp. 4599–4610.
+[Online]. Available: https://aclanthology.org/2021.naacl-main.365/
+[18] P. Rajpurkar, J. Zhang, K. Lopyrev, and P. Liang, “SQuAD: 100,000+
+questions for machine comprehension of text,” in Proceedings of
+EMNLP, 2016, pp. 2383–2392. [Online]. Available: https://aclanthology.
+org/D16-1264/
+[19] dacorvo,
+“Transformers
+coding
+session
+captures,”
+Hugging
+Face
+dataset, 2026, revision ebf80ae3016c39616ccb08066198102eb8b16ed6.
+[Online].
+Available:
+https://huggingface.co/datasets/dacorvo/
+transformers-coding-session-captures
+[20] SGLang
+Project,
+“SGLang
+Model
+Gateway:
+Routing
+policy
+conﬁguration,”
+Ofﬁcial
+source
+code,
+accessed
+September
+20,
+2026.
+[Online].
+Available:
+https://github.com/sgl-project/sglang/blob/
+main/sgl-model-gateway/src/conﬁg/types.rs
