@@ -7,6 +7,7 @@
 | 论文 | 阅读笔记 | 原文 |
 | --- | --- | --- |
 | RadiK: Scalable and Optimized GPU-Parallel Radix Top-K Selection | [中文解读](RadiK_Scalable_and_Optimized_GPU-Parallel_Radix_Top-K_Selection_summary.md) | [arXiv 2501.14336](https://arxiv.org/abs/2501.14336) |
+| LoRA: Low-Rank Adaptation of Large Language Models | [中文解读](LoRA_Low-Rank_Adaptation_of_Large_Language_Models_summary.md) | [arXiv 2106.09685v2](https://arxiv.org/abs/2106.09685v2) |
 
 ## RadiK 笔记内容
 
