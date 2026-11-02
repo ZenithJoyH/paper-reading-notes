@@ -9,6 +9,7 @@
 | RadiK: Scalable and Optimized GPU-Parallel Radix Top-K Selection | [中文解读](RadiK_Scalable_and_Optimized_GPU-Parallel_Radix_Top-K_Selection_summary.md) | [arXiv 2501.14336](https://arxiv.org/abs/2501.14336) |
 | LoRA: Low-Rank Adaptation of Large Language Models | [中文解读](LoRA_Low-Rank_Adaptation_of_Large_Language_Models_summary.md) | [arXiv 2106.09685v2](https://arxiv.org/abs/2106.09685v2) |
 | Push-Based KV Transfer to Improve TTFT and TPOT for Disaggregated Inference in vLLM | [中文工程解读](Push-Based_KV_Transfer_to_Improve_TTFT_and_TPOT_for_Disaggregated_Inference_in_vLLM_summary.md) | [vLLM 官方博客](https://vllm.ai/blog/2026-10-14-nixl-push-connector) |
+| Super-agent 设计探索：迈向更自主的 Agent 系统 | [中文工程解读](Super-agent_设计探索_迈向更自主的_Agent_系统_summary.md) | [DeepSeek 官方文章](https://zhuanlan.zhihu.com/p/2099987320443237060) |
 
 ## RadiK 笔记内容
 
