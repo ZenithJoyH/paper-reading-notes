@@ -12,3 +12,5 @@
 - [2026-10-23：异构KV传输、量化执行、弹性EP与缓存路由](LLM推理研究与工程周报_2026-10-23.md)；论文笔记：[HAWK](论文笔记/2026-10-23/HAWK_summary.md)、[KVCompass](论文笔记/2026-10-23/KVCompass_summary.md)。
 
 - [2026-10-30：KV生命周期、DCP组合、CPU协同解码与64卡评测](LLM推理研究与工程周报_2026-10-30.md)；论文笔记：[DualPace](论文笔记/2026-10-30/DualPace_summary.md)。
+
+- [2026-11-06：缓存组合一致性、配置受控评测与预测筛选](LLM推理研究与工程周报_2026-11-06.md)；论文笔记：[配置与缓存评测](论文笔记/2026-11-06/ConfigCacheEval_summary.md)、[InferaSim](论文笔记/2026-11-06/InferaSim_summary.md)。
