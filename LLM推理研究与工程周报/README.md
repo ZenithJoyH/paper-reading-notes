@@ -9,6 +9,10 @@
 
 ## 历史期次
 
+- [2026-10-14：双向 KV 传输与分层缓存性能建模](LLM推理研究与工程周报_2026-10-14.md)；论文笔记：[分层 KV 缓存性能建模](原文/2026-10-14/2610.15366v1_summary.md)。
+
+- [2026-10-16：Push KV、推测验证与调度评测](LLM推理研究与工程周报_2026-10-16.md)；论文笔记：[BLIS](原文/2026-10-16/2610.14255v1_summary.md)、[KV-Repurpose](原文/2026-10-16/2610.13060v1_summary.md)、[MultiAlloc（备选）](原文/2026-10-16/2610.18642v1_summary.md)。2026-11-09 回补自适应验证的历史追问与教学例子；QPS／并发补充见 [Push 专篇](../Push-Based_KV_Transfer_to_Improve_TTFT_and_TPOT_for_Disaggregated_Inference_in_vLLM_summary.md)。
+
 - [2026-10-23：异构KV传输、量化执行、弹性EP与缓存路由](LLM推理研究与工程周报_2026-10-23.md)；论文笔记：[HAWK](论文笔记/2026-10-23/HAWK_summary.md)、[KVCompass](论文笔记/2026-10-23/KVCompass_summary.md)。
 
 - [2026-10-30：KV生命周期、DCP组合、CPU协同解码与64卡评测](LLM推理研究与工程周报_2026-10-30.md)；论文笔记：[DualPace](论文笔记/2026-10-30/DualPace_summary.md)。
